@@ -7,6 +7,14 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [1.1.0] — 2026-04-11
+
+### Added
+- `--version` flag — prints `kubectl-sentinel 1.1.0` and exits
+- `TOOL_VERSION` constant in script header
+
+---
+
 ## [1.0.0] — 2026-04-11
 
 Initial public release.
