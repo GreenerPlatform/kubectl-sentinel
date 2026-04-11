@@ -125,6 +125,42 @@ Emits a single JSON object to stdout. Errors go to stderr. Safe for pipes and re
 
 `--json` is not supported for `pod/<name>` or `node/<name>` deep-dive modes.
 
+## Works with incident-triage
+
+Pipe the JSON output directly into [incident-triage](https://github.com/GreenerPlatform/incident-triage)
+to get a classified causation chain and a ready-to-run P1 fix command:
+
+```bash
+kubectl sentinel --json -n payments > snap.json
+incident-triage --sentinel-json snap.json --alert "payments API 503 since 14:30"
+```
+
+kubectl-sentinel collects the cluster state in under 10 seconds. incident-triage classifies
+the alert, scores each sentinel finding by relevance, and outputs a root cause, causation
+chain, and P1 command — sourced directly from the `recommendation` field in the sentinel JSON.
+
+## Claude Code skill
+
+This repo ships a `/sentinel` skill for [Claude Code](https://claude.ai/code). Clone the
+repo, open it in Claude Code, and `/sentinel` is available immediately:
+
+```bash
+git clone https://github.com/GreenerPlatform/kubectl-sentinel
+cd kubectl-sentinel
+# open in Claude Code / VS Code with Claude extension
+```
+
+```
+/sentinel -n payments
+/sentinel pod/api-gateway-abc123 -n payments
+/sentinel node/worker-1
+```
+
+The skill uses kubectl-sentinel as its primary data source and adds reasoning — correlating
+a FailedMount to all deployments blocked by the same missing secret, and distinguishing an
+OOMKill that needs a higher limit from one that signals a memory leak. See
+[.claude/commands/sentinel.md](.claude/commands/sentinel.md) for the full skill definition.
+
 ## Why the dual-layer pattern
 
 kubectl-sentinel is the deterministic layer: it collects cluster state, applies severity
@@ -142,7 +178,7 @@ Separating them means each layer is independently testable, portable, and compos
 
 ## Contributing
 
-Issues and pull requests welcome.
+Issues and pull requests welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Design rule: *build for the 3am reader* — every output line is written as if the reader
 has been awake for 3 hours and needs to act in 5 minutes.
