@@ -1,0 +1,1751 @@
+#!/usr/bin/env bash
+# kubectl-sentinel — Kubernetes cluster health checker
+# Usage: kubectl sentinel [-n namespace] [pod/<name>] [node/<name>] [--json] [--no-color]
+# Requires: kubectl, jq
+
+set -euo pipefail
+
+# ── TTY detection (must happen before any fd redirection) ─────────────────────
+IS_TTY=false
+[[ -t 1 ]] && IS_TTY=true
+
+# ── Colours (empty until setup_colors is called after arg parsing) ────────────
+RED=''; YELLOW=''; GREEN=''; CYAN=''; BOLD=''; DIM=''; RESET=''
+
+setup_colors() {
+  [[ "$JSON_MODE"   == true   ]] && return  # JSON output never has color
+  [[ "$IS_TTY"      == false  ]] && return  # not a terminal → plain text
+  [[ "${_NO_COLOR}" == true   ]] && return  # --no-color flag
+  [[ "${NO_COLOR:-}" != ""    ]] && return  # NO_COLOR env var (standard)
+  [[ "${TERM:-dumb}" == "dumb" ]] && return
+  RED=$'\033[0;31m'; YELLOW=$'\033[1;33m'; GREEN=$'\033[0;32m'
+  CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+}
+
+# ── Counters & state ──────────────────────────────────────────────────────────
+CRITICAL_COUNT=0
+WARN_COUNT=0
+OK_COUNT=0
+CRITICAL_RECS=()
+WARN_RECS=()
+NODE_REBOOT_COUNT=0
+PENDING_POD_COUNT=0
+FAILED_MOUNT_SECRET=""
+OOM_CASCADE_NODE_COUNT=0
+OOM_LARGEST_PROCESS=""
+OOM_LARGEST_RSS_MB=0
+
+# ── Section-level counters (parallel arrays, bash 3 compatible) ───────────────
+SECTION_NAMES=()
+SECTION_CRITS=()
+SECTION_WARNS=()
+SECTION_OKS=()
+_LAST_SECTION=""
+_SECTION_START_CRIT=0
+_SECTION_START_WARN=0
+_SECTION_START_OK=0
+
+# ── Output mode state ─────────────────────────────────────────────────────────
+OUTPUT_FORMAT="text"
+JSON_MODE=false
+HTML_MODE=false
+JSON_CURRENT_SECTION=""
+JSON_SECS=()
+JSON_SEVS=()
+JSON_MSGS=()
+JSON_RECS=()
+JSON_LAST_EVENTS=()
+JSON_FINDING_COUNT=0
+
+# ── Output helpers ────────────────────────────────────────────────────────────
+section() {
+  if [[ -n "$_LAST_SECTION" ]]; then
+    SECTION_NAMES+=("$_LAST_SECTION")
+    SECTION_CRITS+=("$(( CRITICAL_COUNT - _SECTION_START_CRIT ))")
+    SECTION_WARNS+=("$(( WARN_COUNT    - _SECTION_START_WARN ))")
+    SECTION_OKS+=(  "$(( OK_COUNT      - _SECTION_START_OK   ))")
+  fi
+  _LAST_SECTION="$1"
+  _SECTION_START_CRIT="$CRITICAL_COUNT"
+  _SECTION_START_WARN="$WARN_COUNT"
+  _SECTION_START_OK="$OK_COUNT"
+
+  JSON_CURRENT_SECTION="$1"
+  if [[ "$JSON_MODE" == false ]]; then
+    echo -e "\n${BOLD}${CYAN}━━ $1 ━━${RESET}"
+    if [[ -z "$POD_TARGET" && -z "$NODE_TARGET" ]]; then
+      printf "| %-8s | %-s |\n" "Severity" "Finding"
+      printf "|----------|--------------------------------------------------------------|\n"
+    fi
+  fi
+}
+
+_finalize_sections() {
+  if [[ -n "$_LAST_SECTION" ]]; then
+    SECTION_NAMES+=("$_LAST_SECTION")
+    SECTION_CRITS+=("$(( CRITICAL_COUNT - _SECTION_START_CRIT ))")
+    SECTION_WARNS+=("$(( WARN_COUNT    - _SECTION_START_WARN ))")
+    SECTION_OKS+=(  "$(( OK_COUNT      - _SECTION_START_OK   ))")
+    _LAST_SECTION=""
+  fi
+}
+
+print_section_summary() {
+  [[ "$JSON_MODE" == true ]] && return
+  [[ "${#SECTION_NAMES[@]}" -eq 0 ]] && return
+
+  printf "| %-12s | %8s | %4s | %4s |\n" "Section" "CRITICAL" "WARN" "OK"
+  printf "|%s|%s|%s|%s|\n" "--------------" "----------" "------" "------"
+
+  local i
+  for (( i=0; i<${#SECTION_NAMES[@]}; i++ )); do
+    local sec="${SECTION_NAMES[$i]}"
+    local cr="${SECTION_CRITS[$i]}"
+    local wn="${SECTION_WARNS[$i]}"
+    local ok_val="${SECTION_OKS[$i]}"
+
+    local cr_col="$DIM" wn_col="$DIM" ok_col="$DIM"
+    [[ "$cr"     -gt 0 ]] && cr_col="$RED"
+    [[ "$wn"     -gt 0 ]] && wn_col="$YELLOW"
+    [[ "$ok_val" -gt 0 ]] && ok_col="$GREEN"
+
+    printf "| %-12s | %s%8s%s | %s%4s%s | %s%4s%s |\n" \
+      "$sec" \
+      "$cr_col" "$cr" "$RESET" \
+      "$wn_col" "$wn" "$RESET" \
+      "$ok_col" "$ok_val" "$RESET"
+  done
+  echo ""
+}
+
+critical() {
+  CRITICAL_COUNT=$((CRITICAL_COUNT + 1))
+  if [[ "$JSON_MODE" == true ]]; then
+    JSON_SECS+=("$JSON_CURRENT_SECTION"); JSON_SEVS+=("CRITICAL")
+    JSON_MSGS+=("$1"); JSON_RECS+=(""); JSON_LAST_EVENTS+=("")
+    JSON_FINDING_COUNT=$((JSON_FINDING_COUNT + 1))
+  elif [[ -n "$POD_TARGET" || -n "$NODE_TARGET" ]]; then
+    echo -e "  ${RED}[CRITICAL]${RESET} $1"
+  else
+    printf "| ${RED}%-8s${RESET} | %s |\n" "CRITICAL" "$1"
+  fi
+}
+
+warn() {
+  WARN_COUNT=$((WARN_COUNT + 1))
+  if [[ "$JSON_MODE" == true ]]; then
+    JSON_SECS+=("$JSON_CURRENT_SECTION"); JSON_SEVS+=("WARN")
+    JSON_MSGS+=("$1"); JSON_RECS+=(""); JSON_LAST_EVENTS+=("")
+    JSON_FINDING_COUNT=$((JSON_FINDING_COUNT + 1))
+  elif [[ -n "$POD_TARGET" || -n "$NODE_TARGET" ]]; then
+    echo -e "  ${YELLOW}[WARN]${RESET} $1"
+  else
+    printf "| ${YELLOW}%-8s${RESET} | %s |\n" "WARN" "$1"
+  fi
+}
+
+ok() {
+  OK_COUNT=$((OK_COUNT + 1))
+  if [[ "$JSON_MODE" == true ]]; then
+    JSON_SECS+=("$JSON_CURRENT_SECTION"); JSON_SEVS+=("OK")
+    JSON_MSGS+=("$1"); JSON_RECS+=(""); JSON_LAST_EVENTS+=("")
+    JSON_FINDING_COUNT=$((JSON_FINDING_COUNT + 1))
+  elif [[ -n "$POD_TARGET" || -n "$NODE_TARGET" ]]; then
+    echo -e "  ${GREEN}[ OK ]${RESET} $1"
+  else
+    printf "| ${GREEN}%-8s${RESET} | %s |\n" "OK" "$1"
+  fi
+}
+
+info() {
+  if [[ "$JSON_MODE" == false ]]; then
+    if [[ -n "$POD_TARGET" || -n "$NODE_TARGET" ]]; then
+      echo -e "  ${DIM}[INFO]${RESET} $1"
+    else
+      printf "|          | %s |\n" "$1"
+    fi
+  fi
+}
+
+last_event_detail() {
+  if [[ "$JSON_MODE" == true && "$JSON_FINDING_COUNT" -gt 0 ]]; then
+    local last=$(( JSON_FINDING_COUNT - 1 ))
+    JSON_LAST_EVENTS[$last]="$(jq -cn \
+      --arg ts "$2" --arg reason "$3" --arg msg "$4" \
+      '{timestamp:$ts,reason:$reason,message:$msg}')"
+  else
+    printf "|          | └─ last event: %s |\n" "$1"
+  fi
+}
+
+critical_rec() {
+  CRITICAL_RECS+=("$1")
+  if [[ "$JSON_MODE" == true && "$JSON_FINDING_COUNT" -gt 0 ]]; then
+    local last=$(( JSON_FINDING_COUNT - 1 ))
+    JSON_RECS[$last]="$1"
+  fi
+}
+
+warn_rec() {
+  WARN_RECS+=("$1")
+  if [[ "$JSON_MODE" == true && "$JSON_FINDING_COUNT" -gt 0 ]]; then
+    local last=$(( JSON_FINDING_COUNT - 1 ))
+    JSON_RECS[$last]="$1"
+  fi
+}
+
+ts()  { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+die() { echo "Error: $1" >&2; exit 1; }
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+_REPORT_BODY=""
+_STDOUT_REDIRECTED=false
+
+_cleanup() {
+  if [[ "$_STDOUT_REDIRECTED" == true ]]; then
+    exec 1>&3 2>/dev/null || true
+    exec 3>&- 2>/dev/null || true
+  fi
+  [[ -n "$_REPORT_BODY" ]] && rm -f "$_REPORT_BODY" 2>/dev/null || true
+}
+trap _cleanup EXIT
+
+# ── Dependency check ──────────────────────────────────────────────────────────
+check_deps() {
+  for cmd in kubectl jq; do
+    command -v "$cmd" &>/dev/null || die "$cmd is required but not found in PATH."
+  done
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+NAMESPACE=""
+POD_TARGET=""
+NODE_TARGET=""
+ALL_NS=true
+_NO_COLOR=false
+VERBOSE=false
+CONTEXT=""
+
+usage() {
+  cat <<'EOF'
+kubectl-sentinel — Kubernetes cluster health checker
+
+Usage:
+  kubectl sentinel                          Full cluster check (all namespaces)
+  kubectl sentinel -n <namespace>           Scoped to one namespace
+  kubectl sentinel --context <name>         Target a specific kubeconfig context
+  kubectl sentinel --context <name> -n <ns> Context + namespace scope
+  kubectl sentinel pod/<name>               Pod deep-dive
+  kubectl sentinel pod/<name> -n <ns>       Pod deep-dive in specific namespace
+  kubectl sentinel node/<name>              Node deep-dive
+  kubectl sentinel --output-format json      Output findings as JSON (canonical flag)
+  kubectl sentinel --output-format html      Output self-contained HTML report
+  kubectl sentinel --json                   Output findings as JSON (alias)
+  kubectl sentinel --html                   Output HTML report (alias)
+  kubectl sentinel --json -n <namespace>    JSON output, scoped to namespace
+  kubectl sentinel --no-color               Disable ANSI colours (plain text)
+  kubectl sentinel --verbose                Full per-pod/per-node detail
+  kubectl sentinel -h|--help               Show this help
+
+Output formats (--output-format text|json|html):
+  text  Terminal-friendly, colour-coded, tabular (default)
+  json  Clean, undecorated JSON — safe for pipes and redirection
+  html  Self-contained HTML — single file, no external dependencies
+  Exit code: 0=OK, 1=WARN, 2=CRITICAL (all formats).
+
+Checks performed:
+  NODES       Ready state, pressure conditions, version skew, cordoned nodes
+  PODS        CrashLoopBackOff, OOMKilled, ImagePullBackOff, high restarts, Pending
+  PROBES      Liveness failures (CRITICAL), readiness/startup failures (WARN)
+  WORKLOADS   Deployments, StatefulSets, DaemonSets — replica availability
+  HTTP        Services on HTTP ports — empty endpoints (CRITICAL), not-ready (WARN)
+  gRPC        Services with grpc port/appProtocol — endpoint health
+  EVENTS      Warning events grouped by reason; FailedMount correlates missing secret
+  RESOURCES   Node CPU/memory via kubectl top; WARN at 85%, CRITICAL at 95%
+  PVCS        Pending/Lost → CRITICAL, Released → WARN
+  HPAS        min == max (cannot autoscale), at max replicas ceiling
+
+Exit codes:
+  0  All checks passed
+  1  One or more WARN findings
+  2  One or more CRITICAL findings
+
+EOF
+  exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--namespace)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      NAMESPACE="$2"; ALL_NS=false; shift 2 ;;
+    pod/*)
+      POD_TARGET="${1#pod/}"; shift ;;
+    node/*)
+      NODE_TARGET="${1#node/}"; shift ;;
+    --context)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      CONTEXT="$2"; shift 2 ;;
+    --output-format)
+      [[ $# -lt 2 ]] && die "Missing value for $1"
+      case "$2" in
+        text)  OUTPUT_FORMAT="text" ;;
+        json)  OUTPUT_FORMAT="json"; JSON_MODE=true ;;
+        html)  OUTPUT_FORMAT="html"; JSON_MODE=true; HTML_MODE=true ;;
+        *)     die "Unknown --output-format value: $2 (valid: text, json, html)" ;;
+      esac
+      shift 2 ;;
+    --json)
+      OUTPUT_FORMAT="json"; JSON_MODE=true; shift ;;
+    --html)
+      OUTPUT_FORMAT="html"; JSON_MODE=true; HTML_MODE=true; shift ;;
+    --no-color)
+      _NO_COLOR=true; shift ;;
+    --verbose)
+      VERBOSE=true; shift ;;
+    -h|--help) usage ;;
+    *) die "Unknown argument: $1" ;;
+  esac
+done
+
+setup_colors
+
+# ── kubectl context wrapper ───────────────────────────────────────────────────
+kube() {
+  if [[ -n "$CONTEXT" ]]; then
+    command kubectl --context "$CONTEXT" "$@"
+  else
+    command kubectl "$@"
+  fi
+}
+
+[[ "$JSON_MODE" == true && ( -n "$POD_TARGET" || -n "$NODE_TARGET" ) ]] && \
+  die "--json is not supported for pod or node deep-dive mode"
+
+ns_flag() {
+  if   [[ -n "$NAMESPACE" ]];      then echo "-n $NAMESPACE"
+  elif [[ "$ALL_NS" == true ]];    then echo "--all-namespaces"
+  fi
+}
+NS_FLAG="$(ns_flag)"
+
+# ── Header ────────────────────────────────────────────────────────────────────
+print_header() {
+  [[ "$JSON_MODE" == true ]] && return
+  local ctx scope
+  ctx="${CONTEXT:-$(kube config current-context 2>/dev/null || echo 'unknown')}"
+  if   [[ -n "$POD_TARGET"  ]]; then scope="pod: $POD_TARGET${NAMESPACE:+ (ns: $NAMESPACE)}"
+  elif [[ -n "$NODE_TARGET" ]]; then scope="node: $NODE_TARGET"
+  elif [[ -n "$NAMESPACE"   ]]; then scope="namespace: $NAMESPACE"
+  else scope="all namespaces"
+  fi
+  echo ""
+  echo -e "${BOLD}${CYAN}══ SENTINEL CLUSTER REPORT ══${RESET}"
+  echo -e "  Context : ${BOLD}${ctx}${RESET}"
+  echo -e "  Scope   : ${scope}"
+  echo -e "  Time    : $(ts)"
+}
+
+# ── Top-of-report status banner ───────────────────────────────────────────────
+print_top_summary() {
+  [[ "$JSON_MODE" == true ]] && return
+  echo ""
+  if [[ "$CRITICAL_COUNT" -gt 0 ]]; then
+    echo -e "${RED}${BOLD}┌─ STATUS: CRITICAL — ${CRITICAL_COUNT} critical, ${WARN_COUNT} warning(s) ──────────────────────────┐${RESET}"
+    local i=0
+    for rec in "${CRITICAL_RECS[@]}"; do
+      echo -e "  ${RED}[CRITICAL]${RESET} ${rec}"
+      i=$((i + 1))
+      if [[ $i -ge 5 && "${#CRITICAL_RECS[@]}" -gt 5 ]]; then
+        echo -e "  ${DIM}... and $((${#CRITICAL_RECS[@]} - 5)) more — see RECOMMENDATIONS section${RESET}"
+        break
+      fi
+    done
+  elif [[ "$WARN_COUNT" -gt 0 ]]; then
+    echo -e "${YELLOW}${BOLD}┌─ STATUS: WARN — ${WARN_COUNT} warning(s) ────────────────────────────────────────────┐${RESET}"
+  else
+    echo -e "${GREEN}${BOLD}┌─ STATUS: ALL CLEAR ────────────────────────────────────────────────────────┐${RESET}"
+  fi
+  echo ""
+}
+
+# ── Root cause correlation ────────────────────────────────────────────────────
+print_root_cause() {
+  [[ "$JSON_MODE" == true ]] && return
+
+  local _rca_printed=false
+
+  if [[ "$OOM_CASCADE_NODE_COUNT" -gt 0 ]]; then
+    if [[ "$_rca_printed" == false ]]; then
+      echo -e "${BOLD}${CYAN}━━ ROOT CAUSE ANALYSIS ━━${RESET}"
+      _rca_printed=true
+    fi
+    echo -e "  ${CYAN}[PATTERN]${RESET} ${OOM_CASCADE_NODE_COUNT} node(s) with FrequentKubeletRestart — OOM memory cascade"
+    if [[ -n "$OOM_LARGEST_PROCESS" && "$OOM_LARGEST_RSS_MB" -gt 0 ]]; then
+      echo -e "  ${CYAN}[LIKELY]${RESET}  '${OOM_LARGEST_PROCESS}' consumed ${OOM_LARGEST_RSS_MB} MB anon-rss — largest single OOM event."
+      echo -e "            This exhausted node memory and killed the kubelet itself."
+      echo -e "            All other OOMKilled pods on the same node are downstream victims."
+      echo -e "  ${CYAN}[ACTION]${RESET}  1. Add a memory limit to '${OOM_LARGEST_PROCESS}' in its workload spec"
+      echo -e "            2. Check all limitless containers: kubectl top pods -A --sort-by=memory"
+      echo -e "            3. Monitor node recovery: kubectl get nodes -w"
+    else
+      echo -e "  ${CYAN}[LIKELY]${RESET}  A container with no memory limit exhausted node memory and killed the kubelet."
+      echo -e "  ${CYAN}[ACTION]${RESET}  1. Find top consumers: kubectl top pods -A --sort-by=memory"
+      echo -e "            2. Add resources.limits.memory to high-memory containers"
+      echo -e "            3. Monitor node recovery: kubectl get nodes -w"
+    fi
+  fi
+
+  if [[ "$NODE_REBOOT_COUNT" -ge 3 && "$PENDING_POD_COUNT" -ge 5 ]]; then
+    if [[ "$_rca_printed" == false ]]; then
+      echo -e "${BOLD}${CYAN}━━ ROOT CAUSE ANALYSIS ━━${RESET}"
+      _rca_printed=true
+    fi
+    echo -e "  ${CYAN}[PATTERN]${RESET} ${NODE_REBOOT_COUNT} node(s) rebooted and ${PENDING_POD_COUNT} pod(s) are Pending"
+    if [[ -n "$FAILED_MOUNT_SECRET" ]]; then
+      echo -e "  ${CYAN}[LIKELY]${RESET}  Node pool cycling disrupted containerd/CoreDNS."
+      echo -e "            Secret '${FAILED_MOUNT_SECRET}' is missing — preventing pods from mounting volumes."
+      echo -e "  ${CYAN}[ACTION]${RESET}  1. Confirm upgrade finished: 'kubectl get nodes'"
+      echo -e "            2. Check secret: 'kubectl get secret ${FAILED_MOUNT_SECRET} ${NS_FLAG}'"
+      echo -e "            3. Recreate if missing — pods will reschedule automatically once present"
+    else
+      echo -e "  ${CYAN}[LIKELY]${RESET}  Node pool cycling is causing scheduling disruption."
+      echo -e "  ${CYAN}[ACTION]${RESET}  Wait for upgrade to complete: 'kubectl get nodes -w'"
+    fi
+  elif [[ -n "$FAILED_MOUNT_SECRET" && "$PENDING_POD_COUNT" -ge 3 ]]; then
+    if [[ "$_rca_printed" == false ]]; then
+      echo -e "${BOLD}${CYAN}━━ ROOT CAUSE ANALYSIS ━━${RESET}"
+      _rca_printed=true
+    fi
+    echo -e "  ${CYAN}[LIKELY]${RESET}  Secret '${FAILED_MOUNT_SECRET}' is missing — blocking ${PENDING_POD_COUNT} pod(s) from starting"
+    echo -e "  ${CYAN}[ACTION]${RESET}  'kubectl get secret ${FAILED_MOUNT_SECRET} ${NS_FLAG}'"
+    echo -e "            Create it if missing — pods will reschedule within seconds"
+  fi
+
+  if [[ "$_rca_printed" == true ]]; then echo ""; fi
+}
+
+# ── JSON emit ─────────────────────────────────────────────────────────────────
+emit_json() {
+  local exit_code=0
+  [[ "$CRITICAL_COUNT" -gt 0 ]] && exit_code=2 || { [[ "$WARN_COUNT" -gt 0 ]] && exit_code=1; }
+
+  local ctx scope_str
+  ctx="${CONTEXT:-$(kube config current-context 2>/dev/null || echo 'unknown')}"
+  if [[ -n "$NAMESPACE" ]]; then scope_str="namespace: $NAMESPACE"
+  else scope_str="all namespaces"; fi
+
+  local canonical_sections=("NODES" "PODS" "PROBES" "WORKLOADS" "HTTP" "gRPC" "EVENTS" "RESOURCES" "PVCS" "HPAS")
+  local sections_json="["
+  local first_sec=true
+
+  for sec in "${canonical_sections[@]}"; do
+    if [[ "$first_sec" == false ]]; then sections_json+=","; fi
+    first_sec=false
+
+    local findings_json="["
+    local first_f=true
+    local i
+    for (( i=0; i<JSON_FINDING_COUNT; i++ )); do
+      [[ "${JSON_SECS[$i]}" != "$sec" ]] && continue
+      if [[ "$first_f" == false ]]; then findings_json+=","; fi
+      first_f=false
+
+      local rec="${JSON_RECS[$i]}"
+      local rec_val
+      if [[ -z "$rec" ]]; then rec_val="null"
+      else rec_val="$(printf '%s' "$rec" | jq -Rs '.')"; fi
+
+      local last_evt="${JSON_LAST_EVENTS[$i]:-}"
+      local last_evt_val
+      if [[ -z "$last_evt" ]]; then last_evt_val="null"
+      else last_evt_val="$last_evt"; fi
+
+      findings_json+="$(printf '%s' "${JSON_MSGS[$i]}" | jq -Rs \
+        --arg sev "${JSON_SEVS[$i]}" \
+        --argjson rec "$rec_val" \
+        --argjson last_event "$last_evt_val" \
+        '{severity:$sev, message:., recommendation:$rec, last_event:$last_event}')"
+    done
+    findings_json+="]"
+
+    sections_json+="{\"section\":\"${sec}\",\"findings\":${findings_json}}"
+  done
+  sections_json+="]"
+
+  jq -n \
+    --arg ver "1.0" \
+    --arg ts "$(ts)" \
+    --arg ctx "$ctx" \
+    --arg scope "$scope_str" \
+    --argjson exit_code "$exit_code" \
+    --argjson critical "$CRITICAL_COUNT" \
+    --argjson warn "$WARN_COUNT" \
+    --argjson ok "$OK_COUNT" \
+    --argjson sections "$sections_json" \
+    '{schema_version:$ver, generated_at:$ts, context:$ctx, scope:$scope, exit_code:$exit_code,
+      summary:{critical:$critical, warn:$warn, ok:$ok},
+      sections:$sections}'
+
+  exit "$exit_code"
+}
+
+# ── HTML emit ─────────────────────────────────────────────────────────────────
+emit_html() {
+  local exit_code=0
+  [[ "$CRITICAL_COUNT" -gt 0 ]] && exit_code=2 || { [[ "$WARN_COUNT" -gt 0 ]] && exit_code=1; }
+
+  local ctx scope_str generated_at
+  ctx="${CONTEXT:-$(kubectl config current-context 2>/dev/null || echo 'unknown')}"
+  if [[ -n "$NAMESPACE" ]]; then scope_str="namespace: $NAMESPACE"
+  else scope_str="all namespaces"; fi
+  generated_at="$(ts)"
+
+  local status_class="ok" status_text="OK"
+  if [[ "$CRITICAL_COUNT" -gt 0 ]]; then status_class="critical"; status_text="CRITICAL"
+  elif [[ "$WARN_COUNT" -gt 0 ]]; then status_class="warn"; status_text="WARN"; fi
+
+  cat <<'HTML_HEAD'
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Sentinel Cluster Report</title>
+<style>
+body { font-family: 'Segoe UI', sans-serif; margin: 2em; background: #f8f9fa; color: #212529; }
+h1 { border-bottom: 3px solid #0078d4; padding-bottom: 0.3em; }
+h2 { margin-top: 1.5em; color: #0078d4; }
+table { border-collapse: collapse; width: 100%; margin: 0.5em 0; }
+th { background: #0078d4; color: white; padding: 0.5em; text-align: left; }
+td { padding: 0.4em 0.6em; border: 1px solid #dee2e6; vertical-align: top; }
+tr.critical { background: #fde8e8; }
+tr.warn { background: #fff3cd; }
+tr.ok { background: #d4edda; }
+td.sev { font-weight: bold; }
+tr.critical td.sev { color: #c00; }
+tr.warn td.sev { color: #856404; }
+tr.ok td.sev { color: #155724; }
+.badge { display: inline-block; padding: 0.2em 0.6em; border-radius: 4px;
+         font-weight: bold; font-size: 0.85em; }
+.badge.critical { background: #f8d7da; color: #721c24; }
+.badge.warn { background: #fff3cd; color: #856404; }
+.badge.ok { background: #d4edda; color: #155724; }
+pre { background: #212529; color: #f8f9fa; padding: 0.8em 1em; border-radius: 4px;
+      overflow-x: auto; font-size: 0.9em; white-space: pre-wrap; word-break: break-word; }
+.meta { color: #6c757d; font-size: 0.9em; }
+</style></head><body>
+HTML_HEAD
+
+  printf '<h1>Sentinel Cluster Report</h1>\n'
+  printf '<p class="meta">Generated: %s &nbsp;|&nbsp; Context: %s &nbsp;|&nbsp; Scope: %s</p>\n' \
+    "$generated_at" "$ctx" "$scope_str"
+  printf '<h2>Status: <span class="badge %s">%s</span> &nbsp;&nbsp; ' "$status_class" "$status_text"
+  printf '%d critical &nbsp; %d warn &nbsp; %d ok</h2>\n' "$CRITICAL_COUNT" "$WARN_COUNT" "$OK_COUNT"
+
+  local canonical_sections=("NODES" "PODS" "PROBES" "WORKLOADS" "HTTP" "gRPC" "EVENTS" "RESOURCES" "PVCS" "HPAS")
+  local _esc
+
+  for sec in "${canonical_sections[@]}"; do
+    printf '<h2>%s</h2>\n' "$sec"
+    printf '<table><tr><th>Severity</th><th>Finding</th><th>Recommendation</th></tr>\n'
+    local i any_in_sec=false
+    for (( i=0; i<JSON_FINDING_COUNT; i++ )); do
+      [[ "${JSON_SECS[$i]}" != "$sec" ]] && continue
+      any_in_sec=true
+      local sev="${JSON_SEVS[$i]}"
+      local sev_class
+      case "$sev" in
+        CRITICAL) sev_class="critical" ;;
+        WARN)     sev_class="warn" ;;
+        *)        sev_class="ok" ;;
+      esac
+      _esc="$(printf '%s' "${JSON_MSGS[$i]}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"
+      local rec_html=""
+      if [[ -n "${JSON_RECS[$i]:-}" ]]; then
+        local rec_esc
+        rec_esc="$(printf '%s' "${JSON_RECS[$i]}" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"
+        rec_html="<pre>${rec_esc}</pre>"
+      fi
+      printf '<tr class="%s"><td class="sev">%s</td><td>%s</td><td>%s</td></tr>\n' \
+        "$sev_class" "$sev" "$_esc" "$rec_html"
+    done
+    if [[ "$any_in_sec" == false ]]; then
+      printf '<tr class="ok"><td class="sev">OK</td><td colspan="2">No findings</td></tr>\n'
+    fi
+    printf '</table>\n'
+  done
+
+  local total_recs=$(( ${#CRITICAL_RECS[@]} + ${#WARN_RECS[@]} ))
+  if [[ "$total_recs" -gt 0 ]]; then
+    printf '<h2>Recommendations</h2>\n<table><tr><th>#</th><th>Severity</th><th>Recommendation</th></tr>\n'
+    local n=1
+    for rec in "${CRITICAL_RECS[@]}"; do
+      _esc="$(printf '%s' "$rec" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"
+      printf '<tr class="critical"><td>%d</td><td class="sev">CRITICAL</td><td>%s</td></tr>\n' "$n" "$_esc"
+      n=$((n + 1))
+    done
+    for rec in "${WARN_RECS[@]}"; do
+      _esc="$(printf '%s' "$rec" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"
+      printf '<tr class="warn"><td>%d</td><td class="sev">WARN</td><td>%s</td></tr>\n' "$n" "$_esc"
+      n=$((n + 1))
+    done
+    printf '</table>\n'
+  fi
+
+  printf '<h2>Summary</h2>\n<table><tr><th>Severity</th><th>Count</th></tr>\n'
+  printf '<tr class="critical"><td class="sev">CRITICAL</td><td>%d</td></tr>\n' "$CRITICAL_COUNT"
+  printf '<tr class="warn"><td class="sev">WARN</td><td>%d</td></tr>\n' "$WARN_COUNT"
+  printf '<tr class="ok"><td class="sev">OK</td><td>%d</td></tr>\n' "$OK_COUNT"
+  printf '</table>\n</body></html>\n'
+
+  exit "$exit_code"
+}
+
+# ── Nodes ─────────────────────────────────────────────────────────────────────
+check_nodes() {
+  section "NODES"
+  local nodes_json any_issue=false
+  nodes_json="$(kube get nodes -o json 2>/dev/null)" || { warn "Could not retrieve nodes"; return; }
+
+  local count
+  count="$(echo "$nodes_json" | jq '.items | length')"
+  [[ "$count" -eq 0 ]] && { warn "No nodes found"; return; }
+
+  local node_events_json
+  node_events_json="$(kube get events --all-namespaces \
+    --field-selector 'involvedObject.kind=Node,type=Warning' \
+    --sort-by='.lastTimestamp' -o json 2>/dev/null)" || node_events_json='{"items":[]}'
+
+  local node_pod_counts
+  node_pod_counts="$(kube get pods --all-namespaces -o json 2>/dev/null | \
+    jq -r '[.items[] | select(.status.phase=="Running") | .spec.nodeName // ""] |
+           group_by(.) | map({key:.[0], value:length}) | from_entries' \
+    2>/dev/null)" || node_pod_counts='{}'
+
+  local versions ver_count
+  versions="$(echo "$nodes_json" | jq -r '[.items[].status.nodeInfo.kubeletVersion] | unique | sort | .[]')"
+  ver_count="$(echo "$versions" | wc -l | tr -d ' ')"
+  if [[ "$ver_count" -gt 1 ]]; then
+    local min_ver max_ver min_minor max_minor
+    min_ver="$(echo "$versions" | head -1)"
+    max_ver="$(echo "$versions" | tail -1)"
+    min_minor="$(echo "$min_ver" | sed 's/^v1\.\([0-9]*\).*/\1/')"
+    max_minor="$(echo "$max_ver" | sed 's/^v1\.\([0-9]*\).*/\1/')"
+    if [[ -n "$min_minor" && -n "$max_minor" ]]; then
+      local skew=$(( max_minor - min_minor ))
+      if [[ "$skew" -gt 2 ]]; then
+        warn "Kubelet version skew of ${skew} minor versions detected (${min_ver} → ${max_ver})"
+        any_issue=true
+      fi
+    fi
+  fi
+
+  local upgrade_pattern_nodes=()
+  local dns_only_nodes=()
+  local sysctl_changed_nodes=()
+
+  while IFS= read -r node_json; do
+    local name
+    name="$(echo "$node_json" | jq -r '.metadata.name')"
+
+    local ready_status ready_reason ready_transition
+    ready_status="$(echo "$node_json" | jq -r '.status.conditions[] | select(.type=="Ready") | .status')"
+    ready_reason="$(echo "$node_json" | jq -r '.status.conditions[] | select(.type=="Ready") | .reason // ""')"
+    ready_transition="$(echo "$node_json" | jq -r '.status.conditions[] | select(.type=="Ready") | .lastTransitionTime // ""')"
+    if [[ "$ready_status" != "True" ]]; then
+      local pods_on_node
+      pods_on_node="$(echo "$node_pod_counts" | jq -r --arg n "$name" '.[$n] // 0')"
+      critical "Node ${name}: NOT Ready (reason: ${ready_reason:-unknown}, since: ${ready_transition}) — ${pods_on_node} running pod(s) affected"
+      critical_rec "Node ${name}: check kubelet — 'kubectl describe node ${name}' and review system logs on the node"
+      any_issue=true
+      NODE_REBOOT_COUNT=$((NODE_REBOOT_COUNT + 1))
+      local oom_on_node
+      oom_on_node="$(echo "$node_events_json" | jq -r \
+        --arg n "$name" '[.items[] | select(.involvedObject.name==$n and .reason=="OOMKilling")] | length')"
+      if [[ "${oom_on_node:-0}" -gt 0 ]]; then
+        OOM_CASCADE_NODE_COUNT=$((OOM_CASCADE_NODE_COUNT + 1))
+      fi
+    fi
+
+    while IFS= read -r condition; do
+      local ctype cstatus ctransition cmsg
+      ctype="$(echo "$condition" | jq -r '.type')"
+      cstatus="$(echo "$condition" | jq -r '.status')"
+      ctransition="$(echo "$condition" | jq -r '.lastTransitionTime // ""')"
+      cmsg="$(echo "$condition" | jq -r '.message // ""')"
+      if [[ "$cstatus" == "True" ]]; then
+        critical "Node ${name}: ${ctype} active since ${ctransition} — ${cmsg}"
+        critical_rec "Node ${name}: ${ctype} — free up resources or cordon/drain with 'kubectl drain ${name} --ignore-daemonsets'"
+        any_issue=true
+      fi
+    done < <(echo "$node_json" | jq -c '.status.conditions[] | select((.type // "") | test("Pressure"))')
+
+    local net_status
+    net_status="$(echo "$node_json" | jq -r '.status.conditions[] | select(.type=="NetworkUnavailable") | .status // "False"')"
+    if [[ "$net_status" == "True" ]]; then
+      critical "Node ${name}: NetworkUnavailable"
+      critical_rec "Node ${name}: NetworkUnavailable — check CNI plugin pods in kube-system and review node network events"
+      any_issue=true
+    fi
+
+    local _standard_conds="^(Ready|MemoryPressure|DiskPressure|PIDPressure|NetworkUnavailable)$"
+    while IFS= read -r extra_cond; do
+      local ectype ecmsg
+      ectype="$(echo "$extra_cond" | jq -r '.type')"
+      ecmsg="$(echo "$extra_cond"  | jq -r '.message // "" | .[0:120]')"
+      if echo "$ectype" | grep -qi "KubeletRestart\|KubeletCrash"; then
+        critical "Node ${name}: ${ectype} — ${ecmsg}"
+        critical_rec "Node ${name}: kubelet crashing repeatedly — likely OOM or disk exhaustion; 'kubectl describe node ${name}'"
+        any_issue=true
+      else
+        sysctl_changed_nodes+=("${name}/${ectype}")
+      fi
+    done < <(echo "$node_json" | jq -c --arg std "$_standard_conds" '
+      .status.conditions[] |
+      select(.status == "True" and ((.type // "") | test($std) | not))' 2>/dev/null || true)
+
+    local unsched
+    unsched="$(echo "$node_json" | jq -r '.spec.unschedulable // false')"
+    if [[ "$unsched" == "true" ]]; then
+      local pods_on_node
+      pods_on_node="$(echo "$node_pod_counts" | jq -r --arg n "$name" '.[$n] // 0')"
+      warn "Node ${name}: cordoned (unschedulable) — ${pods_on_node} running pod(s)"
+      warn_rec "Node ${name}: cordoned — uncordon with 'kubectl uncordon ${name}' when maintenance is complete"
+      any_issue=true
+    fi
+
+    local alloc_mem cap_mem
+    alloc_mem="$(echo "$node_json" | jq -r '.status.allocatable.memory // ""')"
+    cap_mem="$(echo "$node_json"   | jq -r '.status.capacity.memory // ""')"
+    if [[ -n "$alloc_mem" && -n "$cap_mem" ]]; then
+      local alloc_mi cap_mi
+      alloc_mi="$(echo "$alloc_mem" | sed 's/Ki$//' | awk '{printf "%d", $1/1024}')"
+      cap_mi="$(echo "$cap_mem"     | sed 's/Ki$//' | awk '{printf "%d", $1/1024}')"
+      if [[ "$cap_mi" -gt 0 ]]; then
+        local reserved_pct=$(( (cap_mi - alloc_mi) * 100 / cap_mi ))
+        if [[ "$reserved_pct" -gt 25 ]]; then
+          warn "Node ${name}: ${reserved_pct}% memory reserved for system (allocatable ${alloc_mi}Mi / capacity ${cap_mi}Mi)"
+          warn_rec "Node ${name}: high system memory reservation — review kubelet --system-reserved/--kube-reserved flags"
+          any_issue=true
+        fi
+      fi
+    fi
+
+    local node_warn_count
+    node_warn_count="$(echo "$node_events_json" | jq -r \
+      --arg n "$name" '[.items[] | select(.involvedObject.name==$n)] | length')"
+
+    if [[ "${node_warn_count:-0}" -gt 0 ]]; then
+      any_issue=true
+
+      local event_reasons
+      event_reasons="$(echo "$node_events_json" | jq -r \
+        --arg n "$name" '[.items[] | select(.involvedObject.name==$n) | .reason] | unique | sort | .[]')"
+
+      local is_upgrade_pattern=true has_dns=false
+      while IFS= read -r reason; do
+        case "$reason" in
+          ContainerdStart|Rebooted) ;;
+          CoreDNSUnreachable) has_dns=true ;;
+          *) is_upgrade_pattern=false ;;
+        esac
+      done <<< "$event_reasons"
+
+      if [[ "$is_upgrade_pattern" == true ]]; then
+        if [[ "$has_dns" == true ]]; then
+          dns_only_nodes+=("$name")
+        else
+          upgrade_pattern_nodes+=("$name")
+          NODE_REBOOT_COUNT=$((NODE_REBOOT_COUNT + 1))
+        fi
+      else
+        local recent_reasons
+        recent_reasons="$(echo "$node_events_json" | jq -r \
+          --arg n "$name" '
+            [.items[] | select(.involvedObject.name==$n)]
+            | group_by(.reason)
+            | map("\(.[0].reason)(\(length))")
+            | join(", ")')"
+        warn "Node ${name}: ${node_warn_count} Warning event(s) — ${recent_reasons}"
+        warn_rec "Node ${name}: review node events — 'kubectl describe node ${name}'"
+
+        local last_ts last_reason last_msg_text
+        last_ts="$(echo "$node_events_json" | jq -r \
+          --arg n "$name" '[.items[] | select(.involvedObject.name==$n)] | sort_by(.lastTimestamp) | last | .lastTimestamp // ""')"
+        last_reason="$(echo "$node_events_json" | jq -r \
+          --arg n "$name" '[.items[] | select(.involvedObject.name==$n)] | sort_by(.lastTimestamp) | last | .reason // ""')"
+        last_msg_text="$(echo "$node_events_json" | jq -r \
+          --arg n "$name" '[.items[] | select(.involvedObject.name==$n)] | sort_by(.lastTimestamp) | last | .message // "" | .[0:140]')"
+        last_event_detail "${last_ts} ${last_reason}: ${last_msg_text}" "$last_ts" "$last_reason" "$last_msg_text"
+      fi
+    fi
+
+  done < <(echo "$nodes_json" | jq -c '.items[]')
+
+  if [[ "$OOM_CASCADE_NODE_COUNT" -gt 0 ]]; then
+    local oom_max
+    oom_max="$(echo "$node_events_json" | jq -r '
+      [.items[] | select(.reason=="OOMKilling") |
+       {p: (if ((.message // "") | test("Killed process [0-9]+ \\([^)]+\\)"))
+            then (.message | capture("Killed process [0-9]+ \\((?<n>[^)]+)\\)") | .n)
+            else "unknown" end),
+        r: (if ((.message // "") | test("anon-rss:[0-9]+kB"))
+            then (.message | capture("anon-rss:(?<v>[0-9]+)kB") | .v | tonumber)
+            else 0 end)}
+      ] | if length > 0 then sort_by(-.r) | first | "\(.p) \(.r)" else "" end' 2>/dev/null || echo "")"
+    if [[ -n "$oom_max" && "$oom_max" != " 0" ]]; then
+      OOM_LARGEST_PROCESS="$(echo "$oom_max" | awk '{print $1}')"
+      local oom_rss_kb
+      oom_rss_kb="$(echo "$oom_max" | awk '{print $2}')"
+      [[ "$oom_rss_kb" =~ ^[0-9]+$ ]] && OOM_LARGEST_RSS_MB=$(( oom_rss_kb / 1024 ))
+    fi
+  fi
+
+  if [[ "${#upgrade_pattern_nodes[@]}" -gt 0 ]]; then
+    local preview
+    if [[ "${#upgrade_pattern_nodes[@]}" -le 5 ]]; then
+      preview="$(printf '%s, ' "${upgrade_pattern_nodes[@]}")"; preview="${preview%, }"
+    else
+      preview="$(printf '%s, ' "${upgrade_pattern_nodes[@]:0:5}")"; preview="${preview%, } (+$((${#upgrade_pattern_nodes[@]}-5)) more)"
+    fi
+    warn "${#upgrade_pattern_nodes[@]} node(s): rolling-restart events (Rebooted/ContainerdStart) — consistent with node pool upgrade or maintenance"
+    warn_rec "${#upgrade_pattern_nodes[@]} nodes restarted — verify all are back Ready: 'kubectl get nodes'"
+    info "Affected: ${preview}"
+  fi
+
+  if [[ "${#dns_only_nodes[@]}" -gt 0 ]]; then
+    local dns_preview
+    if [[ "${#dns_only_nodes[@]}" -le 5 ]]; then
+      dns_preview="$(printf '%s, ' "${dns_only_nodes[@]}")"; dns_preview="${dns_preview%, }"
+    else
+      dns_preview="$(printf '%s, ' "${dns_only_nodes[@]:0:5}")"; dns_preview="${dns_preview%, } (+$((${#dns_only_nodes[@]}-5)) more)"
+    fi
+    warn "${#dns_only_nodes[@]} node(s): CoreDNSUnreachable events (typically transient during node restarts)"
+    warn_rec "CoreDNS: verify pods running — 'kubectl get pods -n kube-system -l k8s-app=kube-dns'"
+    info "Affected: ${dns_preview}"
+  fi
+
+  if [[ "${#sysctl_changed_nodes[@]}" -gt 0 ]]; then
+    local extra_preview
+    if [[ "${#sysctl_changed_nodes[@]}" -le 4 ]]; then
+      extra_preview="$(printf '%s, ' "${sysctl_changed_nodes[@]}")"; extra_preview="${extra_preview%, }"
+    else
+      extra_preview="${#sysctl_changed_nodes[@]} node/condition pairs"
+    fi
+    warn "${#sysctl_changed_nodes[@]} non-standard node condition(s) are True"
+    warn_rec "Non-standard conditions: verify intentional — 'kubectl describe node <name>' for each affected node"
+    info "Affected: ${extra_preview}"
+    any_issue=true
+  fi
+
+  if [[ "$any_issue" == false ]]; then ok "All ${count} nodes healthy — no pressure, cordon, or kubelet warnings"; fi
+}
+
+# ── Pods ──────────────────────────────────────────────────────────────────────
+check_pods() {
+  section "PODS"
+  local pods_json any_issue=false
+  # shellcheck disable=SC2086
+  pods_json="$(kube get pods $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve pods"; return; }
+
+  local total
+  total="$(echo "$pods_json" | jq '.items | length')"
+  [[ "$total" -eq 0 ]] && { ok "No pods found in scope"; return; }
+
+  local pending_count=0
+  local pending_reasons=()
+  local restart_pods=()
+  local restart_ctrs=()
+  local restart_counts=()
+
+  while IFS= read -r pod_json; do
+    local ns name phase
+    ns="$(echo "$pod_json" | jq -r '.metadata.namespace')"
+    name="$(echo "$pod_json" | jq -r '.metadata.name')"
+    phase="$(echo "$pod_json" | jq -r '.status.phase')"
+
+    if [[ "$phase" == "Failed" ]]; then
+      local reason
+      reason="$(echo "$pod_json" | jq -r '.status.reason // "unknown"')"
+      critical "Pod ${ns}/${name} Failed — reason: ${reason}"
+      critical_rec "Pod ${ns}/${name}: inspect with 'kubectl describe pod ${name} -n ${ns}' and 'kubectl logs ${name} -n ${ns}'"
+      any_issue=true
+    fi
+
+    while IFS= read -r cs_json; do
+      local cname restarts waiting_reason exit_code
+      cname="$(echo "$cs_json" | jq -r '.name')"
+      restarts="$(echo "$cs_json" | jq -r '.restartCount')"
+      waiting_reason="$(echo "$cs_json" | jq -r '.state.waiting.reason // ""')"
+      exit_code="$(echo "$cs_json" | jq -r '.lastState.terminated.exitCode // ""')"
+
+      local _ctr_crash_loop=false
+      case "$waiting_reason" in
+        CrashLoopBackOff)
+          _ctr_crash_loop=true
+          critical "Pod ${ns}/${name} container ${cname}: CrashLoopBackOff (restarts: ${restarts}, last exit: ${exit_code:-?})"
+          critical_rec "Pod ${ns}/${name}/${cname}: check previous logs — 'kubectl logs ${name} -n ${ns} -c ${cname} --previous'"
+          any_issue=true ;;
+        OOMKilled)
+          local mem_limit
+          mem_limit="$(echo "$pod_json" | jq -r --arg c "$cname" \
+            '.spec.containers[] | select(.name==$c) | .resources.limits.memory // "no limit"')"
+          critical "Pod ${ns}/${name} container ${cname}: OOMKilled (limit: ${mem_limit})"
+          critical_rec "Pod ${ns}/${name}/${cname}: increase memory limit above ${mem_limit} in the workload spec"
+          any_issue=true ;;
+        ImagePullBackOff|ErrImagePull)
+          warn "Pod ${ns}/${name} container ${cname}: ${waiting_reason}"
+          warn_rec "Pod ${ns}/${name}/${cname}: verify image name/tag and registry credentials (imagePullSecrets)"
+          any_issue=true ;;
+        Pending|ContainerCreating|PodInitializing) ;;
+        "") ;;
+        *)
+          if [[ -n "$waiting_reason" ]]; then
+            warn "Pod ${ns}/${name} container ${cname}: ${waiting_reason}"
+            any_issue=true
+          fi ;;
+      esac
+
+      if [[ "$restarts" -gt 50 && "$_ctr_crash_loop" == false ]]; then
+        any_issue=true
+        critical "Pod ${ns}/${name} container ${cname}: very high restart count (${restarts})"
+        critical_rec "Pod ${ns}/${name}/${cname}: investigate crash cause — 'kubectl logs ${name} -n ${ns} -c ${cname} --previous'"
+      elif [[ "$restarts" -gt 10 && "$_ctr_crash_loop" == false ]]; then
+        any_issue=true
+        if [[ "$VERBOSE" == true || "$JSON_MODE" == true ]]; then
+          warn "Pod ${ns}/${name} container ${cname}: high restart count (${restarts})"
+          warn_rec "Pod ${ns}/${name}/${cname}: investigate crash cause — 'kubectl logs ${name} -n ${ns} -c ${cname} --previous'"
+        else
+          restart_pods+=("${ns}/${name}")
+          restart_ctrs+=("$cname")
+          restart_counts+=("$restarts")
+        fi
+      fi
+
+      local last_reason
+      last_reason="$(echo "$cs_json" | jq -r '.lastState.terminated.reason // ""')"
+      if [[ "$last_reason" == "OOMKilled" && "$waiting_reason" != "OOMKilled" ]]; then
+        local mem_limit_oom
+        mem_limit_oom="$(echo "$pod_json" | jq -r --arg c "$cname" \
+          '.spec.containers[] | select(.name==$c) | .resources.limits.memory // "none"')"
+        if [[ "$restarts" -gt 5 ]]; then
+          critical "Pod ${ns}/${name} container ${cname}: recurring OOMKills — ${restarts} restarts, memory limit: ${mem_limit_oom}"
+          critical_rec "Pod ${ns}/${name}/${cname}: recurring OOMKilled — set resources.limits.memory; size with 'kubectl top pod ${name} -n ${ns} --containers'"
+        else
+          warn "Pod ${ns}/${name} container ${cname}: previously OOMKilled (memory limit: ${mem_limit_oom})"
+          warn_rec "Pod ${ns}/${name}/${cname}: previously OOMKilled — set resources.limits.memory to prevent recurrence"
+        fi
+        any_issue=true
+      fi
+
+    done < <(echo "$pod_json" | jq -c '.status.containerStatuses // [] | .[]')
+
+    if [[ "$phase" == "Pending" ]]; then
+      PENDING_POD_COUNT=$((PENDING_POD_COUNT + 1))
+      any_issue=true
+
+      if [[ "$VERBOSE" == true || "$JSON_MODE" == true ]]; then
+        local unschedulable_reason
+        unschedulable_reason="$(echo "$pod_json" | jq -r '
+          .status.conditions[]?
+          | select(.type=="PodScheduled" and .status=="False")
+          | .message // ""' | head -1)"
+        [[ -z "$unschedulable_reason" ]] && unschedulable_reason="no scheduling condition yet"
+        warn "Pod ${ns}/${name} is Pending — ${unschedulable_reason}"
+        warn_rec "Pod ${ns}/${name}: pending — 'kubectl describe pod ${name} -n ${ns}'"
+      else
+        local pending_reason
+        pending_reason="$(echo "$pod_json" | jq -r '
+          .status.conditions[]?
+          | select(.type=="PodScheduled" and .status=="False")
+          | .message // ""' | head -1)"
+        [[ -z "$pending_reason" ]] && pending_reason="no scheduling condition yet"
+        pending_reasons+=("${ns}/${name}: ${pending_reason}")
+        pending_count=$((pending_count + 1))
+      fi
+    fi
+
+  done < <(echo "$pods_json" | jq -c '.items[]')
+
+  if [[ "$JSON_MODE" == false && "$VERBOSE" != true ]]; then
+    if [[ "$pending_count" -gt 0 ]]; then
+      local first_entry="${pending_reasons[0]}"
+      local reason_snippet
+      reason_snippet="$(echo "$first_entry" | sed 's/^[^/]*\/[^:]*: //' | cut -c1-100)"
+      if [[ "$pending_count" -eq 1 ]]; then
+        warn "1 pod Pending — ${reason_snippet}"
+      else
+        warn "${pending_count} pods Pending — e.g. ${reason_snippet}"
+        info "Use --verbose to list each pod individually"
+      fi
+      # shellcheck disable=SC2086
+      warn_rec "${pending_count} pod(s) pending — 'kubectl get pods ${NS_FLAG} --field-selector=status.phase=Pending'"
+    fi
+
+    if [[ "${#restart_pods[@]}" -gt 0 ]]; then
+      local restart_total="${#restart_pods[@]}"
+      warn "${restart_total} container(s) with high restart count (>10)"
+      warn_rec "${restart_total} high-restart container(s): check previous logs — 'kubectl logs <pod> -n <ns> -c <container> --previous'"
+      local j
+      for (( j=0; j<${#restart_pods[@]}; j++ )); do
+        info "→ ${restart_pods[$j]} / ${restart_ctrs[$j]}: ${restart_counts[$j]} restarts"
+      done
+    fi
+  fi
+
+  local no_limit_total
+  no_limit_total="$(echo "$pods_json" | jq '
+    [.items[] |
+     select(.metadata.namespace |
+       test("^(kube-system|kube-public|kube-node-lease|gmp-system|istio-system|cert-manager|monitoring)$") | not) |
+     select(any(.spec.containers[]; .resources.limits.memory == null))
+    ] | length' 2>/dev/null || echo 0)"
+
+  if [[ "${no_limit_total:-0}" -gt 0 ]]; then
+    warn "${no_limit_total} pod(s) in non-system namespaces have containers with no memory limit — unbounded allocation can OOMKill the node kubelet"
+    # shellcheck disable=SC2086
+    warn_rec "${no_limit_total} pod(s) missing memory limits: add resources.limits.memory to workload specs"
+    any_issue=true
+  fi
+
+  if [[ "$any_issue" == false ]]; then ok "${total} pods checked — no issues"; fi
+}
+
+# ── Probes ────────────────────────────────────────────────────────────────────
+check_probes() {
+  section "PROBES"
+  local events_json any_issue=false
+  # shellcheck disable=SC2086
+  events_json="$(kube get events $NS_FLAG \
+    --field-selector type=Warning \
+    --sort-by='.lastTimestamp' \
+    -o json 2>/dev/null)" || { warn "Could not retrieve events for probe check"; return; }
+
+  local liveness_failures readiness_failures startup_failures
+  liveness_failures="$(echo "$events_json" | jq '[.items[] | select(.reason=="Unhealthy" and ((.message // "") | test("liveness")))] | length')"
+  readiness_failures="$(echo "$events_json" | jq '[.items[] | select(.reason=="Unhealthy" and ((.message // "") | test("readiness")))] | length')"
+  startup_failures="$(echo "$events_json"   | jq '[.items[] | select(.reason=="Unhealthy" and ((.message // "") | test("startup")))] | length')"
+
+  if [[ "$liveness_failures" -gt 0 ]]; then
+    critical "Liveness probe failures detected (${liveness_failures} events) — pods will be killed/restarted"
+    critical_rec "Liveness probe failures: fix probe path/port/timeout or increase initialDelaySeconds"
+    any_issue=true
+  fi
+
+  if [[ "$readiness_failures" -gt 0 ]]; then
+    warn "Readiness probe failures detected (${readiness_failures} events) — pods removed from service endpoints"
+    warn_rec "Readiness probe failures: check probe endpoint health and initialDelaySeconds"
+    any_issue=true
+  fi
+
+  if [[ "$startup_failures" -gt 0 ]]; then
+    warn "Startup probe failures detected (${startup_failures} events)"
+    warn_rec "Startup probe failures: increase failureThreshold or periodSeconds"
+    any_issue=true
+  fi
+
+  local pods_json
+  # shellcheck disable=SC2086
+  pods_json="$(kube get pods $NS_FLAG -o json 2>/dev/null)"
+  local no_probe_count=0
+  while IFS= read -r pod_json; do
+    local ns
+    ns="$(echo "$pod_json" | jq -r '.metadata.namespace')"
+    [[ "$ns" =~ ^(kube-system|kube-public|kube-node-lease)$ ]] && continue
+
+    local missing
+    missing="$(echo "$pod_json" | jq -r '
+      .spec.containers[] |
+      select((.livenessProbe == null) or (.readinessProbe == null)) |
+      .name' | head -1)"
+    if [[ -n "$missing" ]]; then
+      no_probe_count=$((no_probe_count + 1))
+    fi
+  done < <(echo "$pods_json" | jq -c '.items[] | select(.status.phase=="Running")')
+
+  if [[ "$no_probe_count" -gt 0 ]]; then
+    warn "${no_probe_count} running pod(s) missing liveness or readiness probes (non-system namespaces)"
+    warn_rec "${no_probe_count} pod(s) missing probes: add livenessProbe and readinessProbe"
+    any_issue=true
+  fi
+
+  if [[ "$any_issue" == false ]]; then ok "No probe failures detected"; fi
+}
+
+# ── Workloads ─────────────────────────────────────────────────────────────────
+check_deployments() {
+  section "WORKLOADS"
+
+  local deploy_json deploy_count=0 deploy_issue=false
+  # shellcheck disable=SC2086
+  deploy_json="$(kube get deployments $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve Deployments"; deploy_json='{"items":[]}'; }
+  deploy_count="$(echo "$deploy_json" | jq '.items | length')"
+
+  while IFS= read -r d_json; do
+    local ns name desired available updated ready
+    ns="$(echo "$d_json" | jq -r '.metadata.namespace')"
+    name="$(echo "$d_json" | jq -r '.metadata.name')"
+    desired="$(echo "$d_json" | jq -r '.spec.replicas // 0')"
+    available="$(echo "$d_json" | jq -r '.status.availableReplicas // 0')"
+    updated="$(echo "$d_json" | jq -r '.status.updatedReplicas // 0')"
+    ready="$(echo "$d_json" | jq -r '.status.readyReplicas // 0')"
+
+    if [[ "$desired" -eq 0 ]]; then
+      :
+    elif [[ "$available" -eq 0 ]]; then
+      critical "Deployment ${ns}/${name}: 0/${desired} replicas available"
+      critical_rec "Deployment ${ns}/${name}: no replicas — 'kubectl describe deploy ${name} -n ${ns}'"
+      deploy_issue=true
+    elif [[ "$available" -lt "$desired" ]]; then
+      warn "Deployment ${ns}/${name}: ${available}/${desired} replicas available (updated: ${updated}, ready: ${ready})"
+      warn_rec "Deployment ${ns}/${name}: degraded — 'kubectl get pods -n ${ns}'"
+      deploy_issue=true
+    fi
+  done < <(echo "$deploy_json" | jq -c '.items[]' 2>/dev/null || true)
+
+  if [[ "$deploy_issue" == false ]]; then ok "Deployments: ${deploy_count} checked — all healthy"; fi
+
+  local ss_json ss_count=0 ss_issue=false
+  # shellcheck disable=SC2086
+  ss_json="$(kube get statefulsets $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve StatefulSets"; ss_json='{"items":[]}'; }
+  ss_count="$(echo "$ss_json" | jq '.items | length')"
+
+  while IFS= read -r ss; do
+    local ns name desired ready
+    ns="$(echo "$ss" | jq -r '.metadata.namespace')"
+    name="$(echo "$ss" | jq -r '.metadata.name')"
+    desired="$(echo "$ss" | jq -r '.spec.replicas // 0')"
+    ready="$(echo "$ss" | jq -r '.status.readyReplicas // 0')"
+    if [[ "$desired" -gt 0 && "$ready" -eq 0 ]]; then
+      critical "StatefulSet ${ns}/${name}: 0/${desired} ready"
+      critical_rec "StatefulSet ${ns}/${name}: no pods ready — 'kubectl describe sts ${name} -n ${ns}'"
+      ss_issue=true
+    elif [[ "$ready" -lt "$desired" ]]; then
+      warn "StatefulSet ${ns}/${name}: ${ready}/${desired} ready"
+      warn_rec "StatefulSet ${ns}/${name}: degraded — 'kubectl describe sts ${name} -n ${ns}'"
+      ss_issue=true
+    fi
+  done < <(echo "$ss_json" | jq -c '.items[]' 2>/dev/null || true)
+
+  if [[ "$ss_issue" == false ]]; then ok "StatefulSets: ${ss_count} checked — all healthy"; fi
+
+  local ds_json ds_count=0 ds_issue=false
+  # shellcheck disable=SC2086
+  ds_json="$(kube get daemonsets $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve DaemonSets"; ds_json='{"items":[]}'; }
+  ds_count="$(echo "$ds_json" | jq '.items | length')"
+
+  while IFS= read -r ds; do
+    local ns name desired unavail
+    ns="$(echo "$ds" | jq -r '.metadata.namespace')"
+    name="$(echo "$ds" | jq -r '.metadata.name')"
+    desired="$(echo "$ds" | jq -r '.status.desiredNumberScheduled // 0')"
+    unavail="$(echo "$ds" | jq -r '.status.numberUnavailable // 0')"
+    if [[ "$unavail" -gt 0 ]]; then
+      warn "DaemonSet ${ns}/${name}: ${unavail}/${desired} pods unavailable"
+      warn_rec "DaemonSet ${ns}/${name}: ${unavail} unavailable — 'kubectl describe ds ${name} -n ${ns}'"
+      ds_issue=true
+    fi
+  done < <(echo "$ds_json" | jq -c '.items[]' 2>/dev/null || true)
+
+  if [[ "$ds_issue" == false ]]; then ok "DaemonSets: ${ds_count} checked — all healthy"; fi
+}
+
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+check_http() {
+  section "HTTP"
+  local svc_json ep_json ing_json any_issue=false
+  # shellcheck disable=SC2086
+  svc_json="$(kube get services $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve services"; return; }
+  # shellcheck disable=SC2086
+  ep_json="$(kube get endpoints $NS_FLAG -o json 2>/dev/null)" || true
+  # shellcheck disable=SC2086
+  ing_json="$(kube get ingresses $NS_FLAG -o json 2>/dev/null)" || true
+
+  local http_ports="80|443|8080|8443|3000|8000|8888|9443"
+
+  while IFS= read -r svc_item; do
+    local ns name
+    ns="$(echo "$svc_item" | jq -r '.metadata.namespace')"
+    name="$(echo "$svc_item" | jq -r '.metadata.name')"
+    [[ "$name" == "kubernetes" ]] && continue
+
+    local has_http_port
+    has_http_port="$(echo "$svc_item" | jq -r --arg p "$http_ports" '
+      .spec.ports[]? |
+      select((.port | tostring | test($p)) or ((.name // "") | test("http"; "i"))) |
+      .port' | head -1)"
+    [[ -z "$has_http_port" ]] && continue
+
+    local ep_subsets
+    ep_subsets="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
+      .items[] |
+      select(.metadata.namespace==$ns and .metadata.name==$name) |
+      .subsets // [] | length')"
+
+    if [[ "${ep_subsets:-0}" -eq 0 ]]; then
+      critical "HTTP Service ${ns}/${name}:${has_http_port} — no endpoints (no backing pods)"
+      critical_rec "HTTP Service ${ns}/${name}: verify selector labels match pods — 'kubectl describe svc ${name} -n ${ns}'"
+      any_issue=true
+    else
+      local not_ready
+      not_ready="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
+        .items[] |
+        select(.metadata.namespace==$ns and .metadata.name==$name) |
+        (.notReadyAddresses // []) | length')"
+      if [[ "${not_ready:-0}" -gt 0 ]]; then
+        warn "HTTP Service ${ns}/${name}:${has_http_port} — ${not_ready} endpoint(s) not ready"
+        warn_rec "HTTP Service ${ns}/${name}: pods exist but not ready — check readiness probe and pod health"
+        any_issue=true
+      fi
+    fi
+  done < <(echo "$svc_json" | jq -c '.items[]')
+
+  if [[ -n "$ing_json" ]]; then
+    while IFS= read -r ing; do
+      local ns name lb_ip
+      ns="$(echo "$ing" | jq -r '.metadata.namespace')"
+      name="$(echo "$ing" | jq -r '.metadata.name')"
+      lb_ip="$(echo "$ing" | jq -r '.status.loadBalancer.ingress // [] | length')"
+      if [[ "${lb_ip:-0}" -eq 0 ]]; then
+        warn "Ingress ${ns}/${name}: no load balancer address assigned"
+        warn_rec "Ingress ${ns}/${name}: not provisioned — 'kubectl describe ingress ${name} -n ${ns}'"
+        any_issue=true
+      fi
+    done < <(echo "$ing_json" | jq -c '.items[]' 2>/dev/null || true)
+  fi
+
+  if [[ "$any_issue" == false ]]; then ok "HTTP services and ingresses healthy"; fi
+}
+
+# ── gRPC ──────────────────────────────────────────────────────────────────────
+check_grpc() {
+  section "gRPC"
+  local svc_json ep_json any_issue=false
+  # shellcheck disable=SC2086
+  svc_json="$(kube get services $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve services"; return; }
+  # shellcheck disable=SC2086
+  ep_json="$(kube get endpoints $NS_FLAG -o json 2>/dev/null)" || true
+
+  while IFS= read -r svc_item; do
+    local ns name matched_port
+    ns="$(echo "$svc_item" | jq -r '.metadata.namespace')"
+    name="$(echo "$svc_item" | jq -r '.metadata.name')"
+    [[ "$name" == "kubernetes" ]] && continue
+
+    matched_port="$(echo "$svc_item" | jq -r '
+      .spec.ports[]? |
+      select(
+        ((.name // "") | test("grpc"; "i")) or
+        (.appProtocol // "" | test("grpc"; "i"))
+      ) | .port' | head -1)"
+    [[ -z "$matched_port" ]] && continue
+
+    local ep_subsets
+    ep_subsets="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
+      .items[] |
+      select(.metadata.namespace==$ns and .metadata.name==$name) |
+      .subsets // [] | length')"
+
+    if [[ "${ep_subsets:-0}" -eq 0 ]]; then
+      critical "gRPC Service ${ns}/${name}:${matched_port} — no endpoints"
+      critical_rec "gRPC Service ${ns}/${name}: verify selector — 'kubectl describe svc ${name} -n ${ns}'"
+      any_issue=true
+    else
+      local not_ready
+      not_ready="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
+        .items[] |
+        select(.metadata.namespace==$ns and .metadata.name==$name) |
+        (.notReadyAddresses // []) | length')"
+      if [[ "${not_ready:-0}" -gt 0 ]]; then
+        warn "gRPC Service ${ns}/${name}:${matched_port} — ${not_ready} endpoint(s) not ready"
+        warn_rec "gRPC Service ${ns}/${name}: check readiness probe — 'kubectl describe pod -l app=${name} -n ${ns}'"
+        any_issue=true
+      fi
+    fi
+  done < <(echo "$svc_json" | jq -c '.items[]')
+
+  if [[ "$any_issue" == false ]]; then ok "No gRPC service issues detected"; fi
+}
+
+# ── Events ────────────────────────────────────────────────────────────────────
+check_events() {
+  section "EVENTS"
+  local events_json any_issue=false
+  # shellcheck disable=SC2086
+  events_json="$(kube get events $NS_FLAG \
+    --field-selector type=Warning \
+    --sort-by='.lastTimestamp' \
+    -o json 2>/dev/null)" || { warn "Could not retrieve events"; return; }
+
+  local total
+  total="$(echo "$events_json" | jq '.items | length')"
+  [[ "$total" -eq 0 ]] && { ok "No Warning events"; return; }
+
+  while IFS= read -r line; do
+    local count reason top_secret=""
+    reason="$(echo "$line" | cut -d'(' -f1 | xargs)"
+    count="$(echo "$line" | sed 's/.*(\([0-9]*\))/\1/')"
+
+    if [[ "$count" -gt 50 ]]; then
+      if [[ "$reason" == "FailedMount" ]]; then
+        top_secret="$(echo "$events_json" | jq -r '
+          [.items[] | select(.reason=="FailedMount") | .message |
+           capture("secret \"(?<s>[^\"]+)\" not found") | .s] |
+          group_by(.) | max_by(length) | .[0] // ""' 2>/dev/null || echo "")"
+        if [[ -n "$top_secret" ]]; then
+          FAILED_MOUNT_SECRET="$top_secret"
+          critical "Event reason FailedMount: ${count} occurrences — secret '${top_secret}' not found"
+          # shellcheck disable=SC2086
+          critical_rec "FailedMount (${count}x): 'kubectl get secret ${top_secret} ${NS_FLAG}' and create if absent"
+        else
+          critical "Event reason ${reason}: ${count} occurrences"
+          # shellcheck disable=SC2086
+          critical_rec "Frequent event '${reason}' (${count}x): 'kubectl get events ${NS_FLAG} --field-selector reason=${reason}'"
+        fi
+      else
+        critical "Event reason ${reason}: ${count} occurrences"
+        # shellcheck disable=SC2086
+        critical_rec "Frequent event '${reason}' (${count}x): 'kubectl get events ${NS_FLAG} --field-selector reason=${reason}'"
+      fi
+      any_issue=true
+    elif [[ "$count" -gt 10 ]]; then
+      if [[ "$reason" == "FailedMount" ]]; then
+        top_secret="$(echo "$events_json" | jq -r '
+          [.items[] | select(.reason=="FailedMount") | .message |
+           capture("secret \"(?<s>[^\"]+)\" not found") | .s] |
+          group_by(.) | max_by(length) | .[0] // ""' 2>/dev/null || echo "")"
+        if [[ -n "$top_secret" ]]; then
+          FAILED_MOUNT_SECRET="$top_secret"
+          warn "Event reason FailedMount: ${count} occurrences — secret '${top_secret}' not found"
+          # shellcheck disable=SC2086
+          warn_rec "FailedMount (${count}x): 'kubectl get secret ${top_secret} ${NS_FLAG}' and create if absent"
+        else
+          warn "Event reason ${reason}: ${count} occurrences"
+          # shellcheck disable=SC2086
+          warn_rec "Frequent event '${reason}' (${count}x): 'kubectl get events ${NS_FLAG} --field-selector reason=${reason}'"
+        fi
+      else
+        warn "Event reason ${reason}: ${count} occurrences"
+        # shellcheck disable=SC2086
+        warn_rec "Frequent event '${reason}' (${count}x): 'kubectl get events ${NS_FLAG} --field-selector reason=${reason}'"
+      fi
+      any_issue=true
+    else
+      info "Event reason ${reason}: ${count} occurrence(s)"
+    fi
+  done < <(echo "$events_json" | jq -r '
+    [.items[] | .reason] |
+    group_by(.) |
+    map({reason: .[0], count: length}) |
+    sort_by(-.count) |
+    .[:8][] |
+    "\(.reason) (\(.count))"')
+
+  if [[ "$any_issue" == false ]]; then ok "No significant event warnings"; fi
+}
+
+# ── Resources ─────────────────────────────────────────────────────────────────
+check_resources() {
+  section "RESOURCES"
+  local any_issue=false
+
+  local node_top
+  node_top="$(kube top nodes 2>/dev/null)" || { info "kubectl top nodes unavailable (metrics-server not installed?)"; return; }
+
+  while read -r node cpu_abs cpu_pct mem_abs mem_pct; do
+    local cpu_val mem_val
+    cpu_val="${cpu_pct//%/}"
+    mem_val="${mem_pct//%/}"
+    [[ "$cpu_val" =~ ^[0-9]+$ ]] || continue
+    [[ "$mem_val" =~ ^[0-9]+$ ]] || continue
+
+    if [[ "$cpu_val" -ge 95 ]]; then
+      critical "Node ${node}: CPU at ${cpu_pct}"
+      critical_rec "Node ${node}: CPU critical — 'kubectl top pods -A --sort-by=cpu'"
+      any_issue=true
+    elif [[ "$cpu_val" -ge 85 ]]; then
+      warn "Node ${node}: CPU at ${cpu_pct}"
+      warn_rec "Node ${node}: CPU high — review pod resource requests"
+      any_issue=true
+    fi
+    if [[ "$mem_val" -ge 95 ]]; then
+      critical "Node ${node}: Memory at ${mem_pct}"
+      critical_rec "Node ${node}: Memory critical — 'kubectl top pods -A --sort-by=memory'"
+      any_issue=true
+    elif [[ "$mem_val" -ge 85 ]]; then
+      warn "Node ${node}: Memory at ${mem_pct}"
+      warn_rec "Node ${node}: Memory high — review pod memory limits"
+      any_issue=true
+    fi
+  done < <(echo "$node_top" | tail -n +2)
+
+  if [[ "$any_issue" == false ]]; then ok "Node resource usage within thresholds"; fi
+}
+
+# ── PVCs ──────────────────────────────────────────────────────────────────────
+check_pvcs() {
+  section "PVCS"
+  local pvc_json any_issue=false
+  # shellcheck disable=SC2086
+  pvc_json="$(kube get pvc $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve PVCs"; return; }
+
+  local count
+  count="$(echo "$pvc_json" | jq '.items | length')"
+  [[ "$count" -eq 0 ]] && { ok "No PVCs in scope"; return; }
+
+  while IFS= read -r pvc; do
+    local ns name phase
+    ns="$(echo "$pvc" | jq -r '.metadata.namespace')"
+    name="$(echo "$pvc" | jq -r '.metadata.name')"
+    phase="$(echo "$pvc" | jq -r '.status.phase')"
+
+    case "$phase" in
+      Bound) ;;
+      Pending|Lost)
+        critical "PVC ${ns}/${name}: phase ${phase}"
+        critical_rec "PVC ${ns}/${name}: ${phase} — 'kubectl describe pvc ${name} -n ${ns}'"
+        any_issue=true ;;
+      Released)
+        warn "PVC ${ns}/${name}: Released (data retained but not bound)"
+        warn_rec "PVC ${ns}/${name}: Released — delete if no longer needed or rebind"
+        any_issue=true ;;
+      *)
+        warn "PVC ${ns}/${name}: unexpected phase ${phase}"
+        warn_rec "PVC ${ns}/${name}: unexpected phase — 'kubectl describe pvc ${name} -n ${ns}'"
+        any_issue=true ;;
+    esac
+  done < <(echo "$pvc_json" | jq -c '.items[]')
+
+  if [[ "$any_issue" == false ]]; then ok "${count} PVC(s) all Bound"; fi
+}
+
+# ── HPAs ──────────────────────────────────────────────────────────────────────
+check_hpas() {
+  section "HPAS"
+  local hpa_json any_issue=false
+  # shellcheck disable=SC2086
+  hpa_json="$(kube get hpa $NS_FLAG -o json 2>/dev/null)" || { info "No HPAs or HPA API unavailable"; return; }
+
+  local count
+  count="$(echo "$hpa_json" | jq '.items | length')"
+  [[ "$count" -eq 0 ]] && { ok "No HPAs in scope"; return; }
+
+  while IFS= read -r hpa; do
+    local ns name min_r max_r cur_r
+    ns="$(echo "$hpa" | jq -r '.metadata.namespace')"
+    name="$(echo "$hpa" | jq -r '.metadata.name')"
+    min_r="$(echo "$hpa" | jq -r '.spec.minReplicas // 1')"
+    max_r="$(echo "$hpa" | jq -r '.spec.maxReplicas')"
+    cur_r="$(echo "$hpa" | jq -r '.status.currentReplicas // 0')"
+
+    if [[ "$min_r" -eq "$max_r" ]]; then
+      warn "HPA ${ns}/${name}: minReplicas == maxReplicas (${min_r}) — cannot autoscale"
+      warn_rec "HPA ${ns}/${name}: set maxReplicas > minReplicas — 'kubectl edit hpa ${name} -n ${ns}'"
+      any_issue=true
+    elif [[ "$cur_r" -eq "$max_r" ]]; then
+      warn "HPA ${ns}/${name}: at max replicas (${cur_r}/${max_r})"
+      warn_rec "HPA ${ns}/${name}: at ceiling — increase maxReplicas or reduce load"
+      any_issue=true
+    fi
+  done < <(echo "$hpa_json" | jq -c '.items[]')
+
+  if [[ "$any_issue" == false ]]; then ok "${count} HPA(s) operating normally"; fi
+}
+
+# ── Pod deep-dive ─────────────────────────────────────────────────────────────
+pod_deepdive() {
+  local pod="$1"
+  local ns_arg=""
+  [[ -n "$NAMESPACE" ]] && ns_arg="-n $NAMESPACE"
+
+  echo ""
+  echo -e "${BOLD}${CYAN}══ SENTINEL POD DEEP-DIVE: ${pod} ══${RESET}"
+  echo -e "  Time: $(ts)"
+
+  section "POD STATUS"
+  # shellcheck disable=SC2086
+  kube get pod $ns_arg "$pod" -o json 2>/dev/null | jq -r '
+    "  Namespace : \(.metadata.namespace)",
+    "  Phase     : \(.status.phase)",
+    "  Node      : \(.spec.nodeName // "unassigned")",
+    "  QoS Class : \(.status.qosClass // "n/a")",
+    "",
+    "  Conditions:",
+    (.status.conditions[]? | "    \(.type): \(.status)\(if .reason then " (\(.reason))" else "" end)")
+  '
+
+  section "CONTAINERS"
+  # shellcheck disable=SC2086
+  kube get pod $ns_arg "$pod" -o json 2>/dev/null | jq -r '
+    . as $pod |
+    .status.containerStatuses[]? |
+    . as $cs |
+    ($pod.spec.containers[] | select(.name == $cs.name) | .resources.limits.memory // "none") as $memlimit |
+    "  [\($cs.name)]",
+    "    Image    : \($cs.image)",
+    "    Ready    : \($cs.ready)",
+    "    Restarts : \($cs.restartCount)",
+    "    Mem limit: \($memlimit)",
+    "    State    : \($cs.state | keys[0])",
+    (if $cs.state.waiting then "    Reason   : \($cs.state.waiting.reason)" else "" end),
+    (if $cs.lastState.terminated then
+      "    Last exit: \($cs.lastState.terminated.exitCode) (\($cs.lastState.terminated.reason))"
+    else "" end)
+  '
+
+  section "PROBES"
+  # shellcheck disable=SC2086
+  kube get pod $ns_arg "$pod" -o json 2>/dev/null | jq -r '
+    .spec.containers[] |
+    "  [\(.name)]",
+    (if .livenessProbe then "    Liveness : configured" else "    Liveness : NOT configured" end),
+    (if .readinessProbe then "    Readiness: configured" else "    Readiness: NOT configured" end),
+    (if .startupProbe then "    Startup  : configured" else "" end)
+  '
+
+  section "RECENT EVENTS"
+  # shellcheck disable=SC2086
+  kube get events $ns_arg \
+    --field-selector "involvedObject.name=${pod}" \
+    --sort-by='.lastTimestamp' \
+    -o json 2>/dev/null | jq -r '
+      .items | reverse | .[:20][] |
+      "  \(.lastTimestamp) [\(.type)] \(.reason): \(.message | .[0:120])"'
+
+  section "LOGS (last 50 lines per container)"
+  local containers
+  # shellcheck disable=SC2086
+  containers="$(kube get pod $ns_arg "$pod" -o json | jq -r '.spec.containers[].name')"
+  for container in $containers; do
+    echo -e "\n  ${BOLD}[${container}]${RESET}"
+    # shellcheck disable=SC2086
+    kube logs $ns_arg "$pod" -c "$container" --tail=50 2>/dev/null || echo "  (no logs available)"
+  done
+
+  section "RESOURCE USAGE"
+  # shellcheck disable=SC2086
+  kube top pod $ns_arg "$pod" --containers 2>/dev/null || info "metrics-server unavailable"
+}
+
+# ── Node deep-dive ────────────────────────────────────────────────────────────
+node_deepdive() {
+  local node="$1"
+
+  echo ""
+  echo -e "${BOLD}${CYAN}══ SENTINEL NODE DEEP-DIVE: ${node} ══${RESET}"
+  echo -e "  Time: $(ts)"
+
+  section "NODE STATUS"
+  kube get node "$node" -o json 2>/dev/null | jq -r '
+    "  Kubelet   : \(.status.nodeInfo.kubeletVersion)",
+    "  OS        : \(.status.nodeInfo.osImage)",
+    "  Runtime   : \(.status.nodeInfo.containerRuntimeVersion)",
+    "  Roles     : \(
+      .metadata.labels | to_entries |
+      map(select((.key // "") | test("node-role.kubernetes.io/"))) |
+      map(.key | split("/")[1]) | join(", ")
+      | if . == "" then "worker" else . end
+    )",
+    "",
+    "  Conditions:",
+    (.status.conditions[] | "    \(.type): \(.status)\(if .reason and .reason != "" then " (\(.reason))" else "" end)")
+  '
+
+  section "CAPACITY vs ALLOCATABLE"
+  kube get node "$node" -o json 2>/dev/null | jq -r '
+    "  CPU    : allocatable=\(.status.allocatable.cpu)  /  capacity=\(.status.capacity.cpu)",
+    "  Memory : allocatable=\(.status.allocatable.memory)  /  capacity=\(.status.capacity.memory)",
+    "  Pods   : allocatable=\(.status.allocatable.pods)  /  capacity=\(.status.capacity.pods)"
+  '
+
+  section "TAINTS"
+  kube get node "$node" -o json 2>/dev/null | jq -r '
+    if (.spec.taints // [] | length) > 0 then
+      .spec.taints[] | "  \(.key)\(if .value then "=\(.value)" else "" end):\(.effect)"
+    else "  (none)" end
+  '
+
+  section "RESOURCE USAGE"
+  kube top node "$node" 2>/dev/null || info "metrics-server unavailable"
+
+  section "PODS ON NODE"
+  local pod_json pod_count
+  pod_json="$(kube get pods --all-namespaces --field-selector "spec.nodeName=${node}" -o json 2>/dev/null)"
+  pod_count="$(echo "$pod_json" | jq '.items | length')"
+  echo "$pod_json" | jq -r '
+    .items[] |
+    "  \(.metadata.namespace)/\(.metadata.name) [\(.status.phase)]"
+  '
+  info "Total: ${pod_count} pod(s) on this node"
+
+  local node_ev_json
+  node_ev_json="$(kube get events --all-namespaces \
+    --field-selector "involvedObject.name=${node},involvedObject.kind=Node" \
+    --sort-by='.lastTimestamp' \
+    -o json 2>/dev/null)" || node_ev_json='{"items":[]}'
+
+  section "OOM ANALYSIS"
+  local oom_count
+  oom_count="$(echo "$node_ev_json" | jq '[.items[] | select(.reason=="OOMKilling")] | length')"
+  if [[ "${oom_count:-0}" -gt 0 ]]; then
+    info "${oom_count} OOMKilling event(s) on this node"
+    echo "$node_ev_json" | jq -r '
+      [.items[] | select(.reason=="OOMKilling") |
+       {p: (if ((.message // "") | test("Killed process [0-9]+ \\([^)]+\\)"))
+            then (.message | capture("Killed process [0-9]+ \\((?<n>[^)]+)\\)") | .n)
+            else "unknown" end),
+        r: (if ((.message // "") | test("anon-rss:[0-9]+kB"))
+            then (.message | capture("anon-rss:(?<v>[0-9]+)kB") | .v | tonumber)
+            else 0 end),
+        t: .lastTimestamp}
+      ] |
+      sort_by(-.r) | .[:5][] |
+      "  → \(.p): \(.r / 1024 | floor) MB anon-rss  (last: \(.t))"'
+  else
+    info "No OOMKilling events for this node"
+  fi
+
+  section "RECENT EVENTS"
+  echo "$node_ev_json" | jq -r '
+    .items | reverse | .[:15][] |
+    "  \(.lastTimestamp) [\(.type)] \(.reason): \(.message | .[0:120])"'
+}
+
+# ── Recommendations ───────────────────────────────────────────────────────────
+print_recommendations() {
+  [[ "$JSON_MODE" == true ]] && return
+  local total=$(( ${#CRITICAL_RECS[@]} + ${#WARN_RECS[@]} ))
+  [[ "$total" -eq 0 ]] && return
+
+  echo -e "\n${BOLD}${CYAN}━━ RECOMMENDATIONS ━━${RESET}"
+  printf "| %-3s | %-8s | %-s |\n" "#" "Severity" "Recommendation"
+  printf "|-----|----------|--------------------------------------------------------------|\n"
+  local i=1
+
+  for rec in "${CRITICAL_RECS[@]}"; do
+    printf "| %-3d | ${RED}%-8s${RESET} | %s |\n" "$i" "CRITICAL" "$rec"
+    i=$((i + 1))
+  done
+
+  local warn_cap=10
+  local warn_shown=0
+  local warn_total="${#WARN_RECS[@]}"
+  for rec in "${WARN_RECS[@]}"; do
+    if [[ "$VERBOSE" != true && "$warn_shown" -ge "$warn_cap" ]]; then
+      local remaining=$(( warn_total - warn_shown ))
+      printf "|     |          | %s |\n" "... and ${remaining} more WARN recommendation(s) — use --verbose to see all"
+      break
+    fi
+    printf "| %-3d | ${YELLOW}%-8s${RESET} | %s |\n" "$i" "WARN" "$rec"
+    i=$((i + 1))
+    warn_shown=$((warn_shown + 1))
+  done
+}
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+print_summary() {
+  [[ "$JSON_MODE" == true ]] && return
+  echo ""
+  echo -e "${BOLD}${CYAN}━━ SUMMARY ━━${RESET}"
+  printf "| %-8s | %5s |\n" "Severity" "Count"
+  printf "|----------|-------|\n"
+  if [[ "$CRITICAL_COUNT" -gt 0 ]]; then
+    printf "| ${RED}%-8s${RESET} | %5d |\n" "CRITICAL" "$CRITICAL_COUNT"
+  else
+    printf "| ${DIM}%-8s${RESET} | %5d |\n" "CRITICAL" "$CRITICAL_COUNT"
+  fi
+  if [[ "$WARN_COUNT" -gt 0 ]]; then
+    printf "| ${YELLOW}%-8s${RESET} | %5d |\n" "WARN" "$WARN_COUNT"
+  else
+    printf "| ${DIM}%-8s${RESET} | %5d |\n" "WARN" "$WARN_COUNT"
+  fi
+  printf "| ${GREEN}%-8s${RESET} | %5d |\n" "OK" "$OK_COUNT"
+  echo ""
+
+  if [[ "$CRITICAL_COUNT" -gt 0 ]]; then
+    exit 2
+  elif [[ "$WARN_COUNT" -gt 0 ]]; then
+    exit 1
+  fi
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+main() {
+  check_deps
+
+  if [[ -n "$POD_TARGET" ]]; then
+    pod_deepdive "$POD_TARGET"
+    exit 0
+  fi
+
+  if [[ -n "$NODE_TARGET" ]]; then
+    node_deepdive "$NODE_TARGET"
+    exit 0
+  fi
+
+  if [[ "$JSON_MODE" == true ]]; then
+    check_nodes
+    check_pods
+    check_probes
+    check_deployments
+    check_http
+    check_grpc
+    check_events
+    check_resources
+    check_pvcs
+    check_hpas
+    _finalize_sections
+    if [[ "$HTML_MODE" == true ]]; then
+      emit_html
+    else
+      emit_json
+    fi
+  fi
+
+  print_header
+
+  _REPORT_BODY="$(mktemp)"
+
+  _spinner_frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  _spin() {
+    local i=0
+    while true; do
+      printf "\r  %s  Collecting cluster data…" "${_spinner_frames[i % ${#_spinner_frames[@]}]}" >&2
+      sleep 0.1
+      i=$((i + 1))
+    done
+  }
+  _spin &
+  _SPINNER_PID=$!
+
+  exec 3>&1
+  exec 1>"$_REPORT_BODY"
+  _STDOUT_REDIRECTED=true
+
+  check_nodes
+  check_pods
+  check_probes
+  check_deployments
+  check_http
+  check_grpc
+  check_events
+  check_resources
+  check_pvcs
+  check_hpas
+
+  exec 1>&3
+  exec 3>&-
+  _STDOUT_REDIRECTED=false
+
+  kill "$_SPINNER_PID" 2>/dev/null && wait "$_SPINNER_PID" 2>/dev/null || true
+  printf "\r\033[K" >&2
+
+  _finalize_sections
+
+  print_top_summary
+  print_section_summary
+  print_root_cause
+  cat "$_REPORT_BODY"
+  print_recommendations
+  print_summary
+}
+
+main "$@"
