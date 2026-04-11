@@ -1,23 +1,42 @@
-# kubectl-sentinel
+## Why Kubernetes Health Checks Fail
 
-Kubernetes cluster health checker. Runs 10 checks across nodes, pods, workloads, services, probes, events, resources, PVCs, and HPAs. Outputs a ranked report with CRITICAL/WARN/OK findings and concrete kubectl remediation commands.
+Cluster issues show up as alerts — not root causes. You get paged for a pod
+CrashLoopBackOff when the real cause is a missing secret that took down 11
+deployments. Standard tooling tells you *what* failed, not *why*.
 
-Works standalone (no Claude required) and as the data source for the `/sentinel` Claude skill.
+> **One command. Ten health dimensions. The fix, not just the finding.**
+
+```bash
+kubectl sentinel -n payments
+```
+
+```
+══ SENTINEL REPORT ══
+Context : gke-prod-eu
+Scope   : namespace: payments
+
+CRITICAL  payments/api-gateway: CrashLoopBackOff (restarts: 47)
+          → kubectl rollout restart deploy/api-gateway -n payments
+CRITICAL  payments: Deployment api-gateway — 0/3 replicas available
+          → kubectl describe deploy/api-gateway -n payments
+WARN      FailedMount: Secret api-keys not found in namespace payments
+WARN      payments/api-gateway: Liveness probe failing
+
+Summary: 2 CRITICAL · 2 WARN · 8 OK
+```
 
 ---
 
-## Requirements
-
-- `kubectl` in PATH with cluster access
-- `jq` in PATH
-- A valid kubeconfig
-
-## Installation
+## Install
 
 ```bash
 bash install.sh          # installs to ~/bin
-bash install.sh /usr/local/bin  # or a custom path
+bash install.sh /usr/local/bin  # custom path
 ```
+
+**Requirements:** `kubectl` in PATH · `jq` in PATH · a valid kubeconfig
+
+---
 
 ## Usage
 
@@ -29,11 +48,26 @@ kubectl sentinel --context <name> -n <ns> # context + namespace scope
 kubectl sentinel pod/<name>               # pod deep-dive
 kubectl sentinel pod/<name> -n <ns>       # pod deep-dive in specific namespace
 kubectl sentinel node/<name>              # node deep-dive
-kubectl sentinel --json                   # JSON output (all namespaces)
+kubectl sentinel --json                   # JSON output (schema v1.0)
 kubectl sentinel --json -n <namespace>    # JSON output (scoped)
 kubectl sentinel --no-color               # plain text (no ANSI)
 kubectl sentinel --verbose                # full per-pod/per-node detail
 ```
+
+## What it checks
+
+| Section | What | CRITICAL when | WARN when |
+|---------|------|---------------|-----------|
+| NODES | Ready state, pressure conditions, version skew, cordoned nodes | NotReady, MemoryPressure, DiskPressure | PIDPressure, version skew, kubelet warnings |
+| PODS | Phase, restart count, container state | CrashLoopBackOff, OOMKilled, ImagePullBackOff | Pending with reason, high restart count |
+| PROBES | Liveness, readiness, startup probe health | Liveness failing | Readiness/startup failing, missing probes |
+| WORKLOADS | Deployments, StatefulSets, DaemonSets — replica availability | 0 available replicas | Partial replica availability |
+| HTTP | Services on HTTP ports — endpoint health, ingress provisioning | Empty endpoints | Not-ready endpoints |
+| gRPC | Services with `grpc` port name or `appProtocol` — endpoint health | Empty endpoints | Not-ready endpoints |
+| EVENTS | Warning events grouped by reason; FailedMount correlates missing secret | — | Any Warning event |
+| RESOURCES | Node CPU/memory via `kubectl top` | ≥95% | ≥85% |
+| PVCS | PersistentVolumeClaim state | Pending, Lost | Released |
+| HPAS | HPA autoscaling constraints | minReplicas == maxReplicas | At maxReplicas ceiling |
 
 ## Flags
 
@@ -41,9 +75,7 @@ kubectl sentinel --verbose                # full per-pod/per-node detail
 |------|-------------|
 | `-n <namespace>` | Scope all checks to one namespace |
 | `--context <name>` | Use a specific kubeconfig context without changing the active one |
-| `--output-format text\|json\|html` | Output format (canonical flag) |
-| `--json` | Emit findings as structured JSON (alias for `--output-format json`) |
-| `--html` | Emit self-contained HTML report (alias for `--output-format html`) |
+| `--json` | Emit findings as structured JSON (schema v1.0) to stdout |
 | `--no-color` | Disable ANSI colour output |
 | `--verbose` | Expand all grouped findings; remove WARN recommendation cap |
 | `-h`, `--help` | Show usage |
@@ -56,13 +88,17 @@ kubectl sentinel --verbose                # full per-pod/per-node detail
 | `1` | One or more WARN findings |
 | `2` | One or more CRITICAL findings |
 
-Exit codes are preserved in `--json` and `--html` modes (`exit_code` field).
+Exit codes are preserved in `--json` mode. Use them in CI:
 
-## JSON output (`--json`)
+```bash
+kubectl sentinel --json -n payments > snap.json
+echo "Exit: $?"  # 0=ok, 1=warn, 2=critical
+```
+
+## JSON output
 
 Emits a single JSON object to stdout. Errors go to stderr. Safe for pipes and redirection.
 
-Schema v1.0:
 ```json
 {
   "schema_version": "1.0",
@@ -73,12 +109,12 @@ Schema v1.0:
   "summary": { "critical": 0, "warn": 3, "ok": 8 },
   "sections": [
     {
-      "section": "NODES | PODS | PROBES | ...",
+      "section": "PODS",
       "findings": [
         {
-          "severity": "CRITICAL | WARN | OK",
+          "severity": "CRITICAL",
           "message": "<finding>",
-          "recommendation": "<kubectl command | null>",
+          "recommendation": "kubectl rollout restart deploy/...",
           "last_event": { "timestamp": "...", "reason": "...", "message": "..." }
         }
       ]
@@ -89,27 +125,24 @@ Schema v1.0:
 
 `--json` is not supported for `pod/<name>` or `node/<name>` deep-dive modes.
 
-## Checks
+## Why the dual-layer pattern
 
-| Section | What is checked |
-|---------|----------------|
-| NODES | Ready state, pressure conditions (Memory/Disk/PID), version skew, cordoned nodes, kubelet warnings |
-| PODS | Failed phase, CrashLoopBackOff, OOMKilled, ImagePullBackOff, high restart count, Pending with scheduling reason |
-| PROBES | Liveness failures (CRITICAL), readiness/startup failures (WARN), missing probes |
-| WORKLOADS | Deployments, StatefulSets, DaemonSets — replica availability |
-| HTTP | Services on HTTP ports — empty endpoints (CRITICAL), not-ready endpoints (WARN), ingress provisioning |
-| gRPC | Services with `grpc` port name or `appProtocol` — endpoint health |
-| EVENTS | Warning events grouped by reason; FailedMount correlates missing secret |
-| RESOURCES | Node CPU/memory via `kubectl top`; WARN ≥85%, CRITICAL ≥95% |
-| PVCS | Pending/Lost → CRITICAL, Released → WARN |
-| HPAS | `minReplicas == maxReplicas` (cannot autoscale), at `maxReplicas` ceiling |
+kubectl-sentinel is the deterministic layer: it collects cluster state, applies severity
+rules, and emits structured output in under 10 seconds. It works at 3am in CI with no
+internet access and no external dependencies.
 
-## Claude skill
+The `/sentinel` Claude Code skill is the reasoning layer: it reads the JSON output and
+explains *why* findings matter — correlating a FailedMount event to the 11 deployments
+that depend on the missing secret, or explaining that an OOMKill at the memory limit
+boundary may indicate a memory leak rather than an undersized limit.
 
-Install `kubectl-sentinel`, then invoke the `/sentinel` Claude Code skill. It uses this tool as its primary data source:
+Separating them means each layer is independently testable, portable, and composable.
 
-```bash
-kubectl-sentinel --json [-n <namespace>] [--context <name>]
-```
+---
 
-The skill falls back to direct kubectl calls if the script is not installed.
+## Contributing
+
+Issues and pull requests welcome.
+
+Design rule: *build for the 3am reader* — every output line is written as if the reader
+has been awake for 3 hours and needs to act in 5 minutes.
