@@ -12,7 +12,7 @@ kubectl sentinel -n payments
 
 ```
 ══ SENTINEL REPORT ══
-Context : gke-prod-eu
+Context : prod-cluster
 Scope   : namespace: payments
 
 CRITICAL  payments/api-gateway: CrashLoopBackOff (restarts: 47)
@@ -141,13 +141,11 @@ chain, and P1 command — sourced directly from the `recommendation` field in th
 
 ## Claude Code skill
 
-This repo ships a `/sentinel` skill for [Claude Code](https://claude.ai/code). Clone the
-repo, open it in Claude Code, and `/sentinel` is available immediately:
+The skill definition lives at [`skills/SKILL.md`](skills/SKILL.md). To use `/sentinel`
+in any Claude Code project, copy it to `.claude/commands/sentinel.md`:
 
 ```bash
-git clone https://github.com/GreenerPlatform/kubectl-sentinel
-cd kubectl-sentinel
-# open in Claude Code / VS Code with Claude extension
+cp skills/SKILL.md /path/to/your-project/.claude/commands/sentinel.md
 ```
 
 ```
@@ -158,8 +156,7 @@ cd kubectl-sentinel
 
 The skill uses kubectl-sentinel as its primary data source and adds reasoning — correlating
 a FailedMount to all deployments blocked by the same missing secret, and distinguishing an
-OOMKill that needs a higher limit from one that signals a memory leak. See
-[.claude/commands/sentinel.md](.claude/commands/sentinel.md) for the full skill definition.
+OOMKill that needs a higher limit from one that signals a memory leak.
 
 ## Why the dual-layer pattern
 
