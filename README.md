@@ -1,3 +1,17 @@
+<div align="center">
+  <img src="docs/banner.svg" alt="kubectl-sentinel" width="100%"/>
+</div>
+
+<div align="center">
+  <img src="https://img.shields.io/badge/shell-bash-4EAA25?style=flat-square&logo=gnu-bash&logoColor=white" alt="bash"/>
+  <img src="https://img.shields.io/badge/kubectl-plugin-326CE5?style=flat-square&logo=kubernetes&logoColor=white" alt="kubectl plugin"/>
+  <img src="https://img.shields.io/badge/output-JSON%20%7C%20text%20%7C%20HTML-lightgrey?style=flat-square" alt="output formats"/>
+  <img src="https://img.shields.io/badge/CI%20safe-exit%200%2F1%2F2-brightgreen?style=flat-square" alt="exit codes"/>
+  <img src="https://img.shields.io/github/license/GreenerPlatform/kubectl-sentinel?style=flat-square" alt="license"/>
+</div>
+
+---
+
 ## Why Kubernetes Health Checks Fail
 
 Cluster issues show up as alerts — not root causes. You get paged for a pod
