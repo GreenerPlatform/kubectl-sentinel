@@ -7,6 +7,24 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [1.2.0] — 2026-07-03
+
+### Added — five new deterministic checks (single-`kubectl` snapshot, no new dependencies)
+- **JOBS** — failed Jobs (CRITICAL), Jobs retrying toward `backoffLimit` with no success (WARN), suspended CronJobs (WARN)
+- **PDBS** — PodDisruptionBudget protection breached `currentHealthy < desiredHealthy` (CRITICAL); `disruptionsAllowed == 0` blocks node drains/upgrades (WARN)
+- **QUOTAS** — ResourceQuota saturation for integer-valued resources (pods, object counts): ≥100% → new objects rejected (CRITICAL), ≥90% (WARN). CPU/memory quantities intentionally skipped to avoid unit-math false positives
+- **DNS** — CoreDNS/kube-dns availability in `kube-system` (cluster-wide): 0 available → CRITICAL, degraded → WARN
+- **CERTS** — cert-manager `Certificate` expiry from `.status.notAfter` (expired/≤7d CRITICAL, ≤21d WARN) and not-`Ready` (CRITICAL); gracefully skipped when the CRD is absent
+
+### Added — extensions to existing sections
+- **PODS** — flags containers with no CPU request (poor scheduling + lowest QoS/eviction priority) (WARN)
+- **WORKLOADS** — flags Deployments whose rollout is not Progressing (e.g. `ProgressDeadlineExceeded`) while old replicas stay up (WARN)
+
+### Notes
+- JSON schema unchanged (`schema_version` 1.0) — only new section names appear. Exit-code semantics unchanged.
+
+---
+
 ## [1.1.1] — 2026-07-02
 
 ### Fixed

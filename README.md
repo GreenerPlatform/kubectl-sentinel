@@ -83,6 +83,13 @@ kubectl sentinel --verbose                # full per-pod/per-node detail
 | RESOURCES | Node CPU/memory via `kubectl top` | ≥95% | ≥85% |
 | PVCS | PersistentVolumeClaim state | Pending, Lost | Released |
 | HPAS | HPA autoscaling constraints | minReplicas == maxReplicas | At maxReplicas ceiling |
+| JOBS | Jobs & CronJobs — completion, backoff, scheduling | Job `Failed` condition | Retrying (no success yet), suspended CronJob |
+| PDBS | PodDisruptionBudgets — protection & drain safety | `currentHealthy < desiredHealthy` | `disruptionsAllowed == 0` (blocks drains) |
+| QUOTAS | ResourceQuota saturation (integer resources) | ≥100% (objects rejected) | ≥90% |
+| DNS | CoreDNS/kube-dns availability (kube-system, cluster-wide) | 0 replicas available | Degraded (partial) |
+| CERTS | cert-manager Certificate expiry & readiness | Expired / ≤7d / not Ready | ≤21d to expiry |
+
+PODS also flags containers with **no CPU request** (WARN); WORKLOADS also flags **stuck rollouts** (`Progressing=False` / `ProgressDeadlineExceeded`, WARN).
 
 ## Flags
 

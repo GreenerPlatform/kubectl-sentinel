@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # kubectl-sentinel — Kubernetes cluster health checker
-# Version: 1.1.1
+# Version: 1.2.0
 # Usage: kubectl sentinel [-n namespace] [pod/<name>] [node/<name>] [--json] [--no-color]
 # Requires: kubectl, jq
-TOOL_VERSION="1.1.1"
+TOOL_VERSION="1.2.0"
 
 set -euo pipefail
 
@@ -287,6 +287,16 @@ Checks performed (full cluster mode):
   RESOURCES   Node CPU/memory via kubectl top; WARN at 85%, CRITICAL at 95%
   PVCS        Pending/Lost → CRITICAL, Released → WARN
   HPAS        min == max (cannot autoscale), at max replicas ceiling
+  JOBS        Failed Jobs (CRITICAL), retrying Jobs (WARN), suspended CronJobs (WARN)
+  PDBS        Protection breached currentHealthy<desiredHealthy (CRITICAL),
+              0 disruptions allowed → blocks drains (WARN)
+  QUOTAS      ResourceQuota (integer resources) ≥100% → objects rejected (CRITICAL), ≥90% (WARN)
+  DNS         CoreDNS/kube-dns availability in kube-system (cluster-wide)
+  CERTS       cert-manager Certificate expiry (≤7d/expired CRITICAL, ≤21d WARN) and not-Ready
+
+Also under PODS/WORKLOADS:
+  PODS        + containers with no CPU request (WARN)
+  WORKLOADS   + rollout not Progressing / ProgressDeadlineExceeded (WARN)
 
 Pod deep-dive adds:
   Phase, conditions, QoS class; per-container image/ready/restarts/exit codes;
@@ -479,7 +489,7 @@ emit_json() {
   if [[ -n "$NAMESPACE" ]]; then scope_str="namespace: $NAMESPACE"
   else scope_str="all namespaces"; fi
 
-  local canonical_sections=("NODES" "PODS" "PROBES" "WORKLOADS" "HTTP" "gRPC" "EVENTS" "RESOURCES" "PVCS" "HPAS")
+  local canonical_sections=("NODES" "PODS" "PROBES" "WORKLOADS" "HTTP" "gRPC" "EVENTS" "RESOURCES" "PVCS" "HPAS" "JOBS" "PDBS" "QUOTAS" "DNS" "CERTS")
   local sections_json="["
   local first_sec=true
 
@@ -586,7 +596,7 @@ HTML_HEAD
   printf '%d critical &nbsp; %d warn &nbsp; %d ok</h2>\n' "$CRITICAL_COUNT" "$WARN_COUNT" "$OK_COUNT"
 
   # ── Section tables ──
-  local canonical_sections=("NODES" "PODS" "PROBES" "WORKLOADS" "HTTP" "gRPC" "EVENTS" "RESOURCES" "PVCS" "HPAS")
+  local canonical_sections=("NODES" "PODS" "PROBES" "WORKLOADS" "HTTP" "gRPC" "EVENTS" "RESOURCES" "PVCS" "HPAS" "JOBS" "PDBS" "QUOTAS" "DNS" "CERTS")
   local _esc  # reusable local for HTML-escaped strings
 
   for sec in "${canonical_sections[@]}"; do
@@ -1114,6 +1124,21 @@ check_pods() {
     any_issue=true
   fi
 
+  # Missing CPU requests (non-system namespaces) — the scheduler can't place these
+  # correctly, the node can be overcommitted, and they get the lowest QoS (first throttled/evicted).
+  local no_cpu_req_total
+  no_cpu_req_total="$(echo "$pods_json" | jq '
+    [.items[] |
+     select(.metadata.namespace |
+       test("^(kube-system|kube-public|kube-node-lease|gmp-system|istio-system|cert-manager|monitoring)$") | not) |
+     select(any(.spec.containers[]; (.resources.requests.cpu // null) == null))
+    ] | length' 2>/dev/null || echo 0)"
+  if [[ "${no_cpu_req_total:-0}" -gt 0 ]]; then
+    warn "${no_cpu_req_total} pod(s) in non-system namespaces have containers with no CPU request — the scheduler can overcommit the node and these pods are first to be throttled/evicted"
+    warn_rec "${no_cpu_req_total} pod(s) missing CPU requests: set resources.requests.cpu on workload specs so the scheduler can place them and honour QoS"
+    any_issue=true
+  fi
+
   if [[ "$any_issue" == false ]]; then ok "${total} pods checked — no issues"; fi
 }
 
@@ -1224,6 +1249,19 @@ check_deployments() {
       warn "Deployment ${ns}/${name}: ${available}/${desired} replicas available (updated: ${updated}, ready: ${ready})"
       warn_rec "Deployment ${ns}/${name}: degraded — check pod failures with 'kubectl get pods -n ${ns}'"
       deploy_issue=true
+    fi
+
+    # Rollout stuck: Progressing=False (e.g. ProgressDeadlineExceeded) even while
+    # some old replicas stay up — the new version can't roll out.
+    if [[ "$desired" -gt 0 && "$available" -gt 0 ]]; then
+      local prog_status prog_reason
+      prog_status="$(echo "$d_json" | jq -r '[.status.conditions[]? | select(.type=="Progressing")][0].status // ""')"
+      prog_reason="$(echo "$d_json" | jq -r '[.status.conditions[]? | select(.type=="Progressing")][0].reason // ""')"
+      if [[ "$prog_status" == "False" ]]; then
+        warn "Deployment ${ns}/${name}: rollout not progressing (${prog_reason:-stuck}) — new revision is stalled"
+        warn_rec "Deployment ${ns}/${name}: stalled rollout — 'kubectl rollout status deploy/${name} -n ${ns}' then inspect the newest ReplicaSet's pods; 'kubectl rollout undo' if the new image is bad"
+        deploy_issue=true
+      fi
     fi
   done < <(echo "$deploy_json" | jq -c '.items[]' 2>/dev/null || true)
 
@@ -1587,6 +1625,197 @@ check_hpas() {
   if [[ "$any_issue" == false ]]; then ok "${count} HPA(s) operating normally"; fi
 }
 
+# ── Jobs / CronJobs ───────────────────────────────────────────────────────────
+check_jobs() {
+  section "JOBS"
+  local jobs_json count=0 any_issue=false
+  # shellcheck disable=SC2086
+  jobs_json="$(kube get jobs $NS_FLAG -o json 2>/dev/null)" || { info "Jobs API unavailable"; jobs_json='{"items":[]}'; }
+  count="$(echo "$jobs_json" | jq '.items | length')"
+
+  while IFS= read -r j; do
+    local ns name failed succeeded failed_cond
+    ns="$(echo "$j" | jq -r '.metadata.namespace')"
+    name="$(echo "$j" | jq -r '.metadata.name')"
+    failed="$(echo "$j" | jq -r '.status.failed // 0')"
+    succeeded="$(echo "$j" | jq -r '.status.succeeded // 0')"
+    failed_cond="$(echo "$j" | jq -r '[.status.conditions[]? | select(.type=="Failed" and .status=="True")][0].reason // ""')"
+    if [[ -n "$failed_cond" ]]; then
+      critical "Job ${ns}/${name}: Failed (${failed_cond}) — ${failed} failed pod(s)"
+      critical_rec "Job ${ns}/${name}: 'kubectl describe job ${name} -n ${ns}' and 'kubectl logs job/${name} -n ${ns}' to see why it failed"
+      any_issue=true
+    elif [[ "${failed:-0}" -gt 0 && "${succeeded:-0}" -eq 0 ]]; then
+      warn "Job ${ns}/${name}: ${failed} failed pod(s), none succeeded yet — retrying toward backoffLimit"
+      warn_rec "Job ${ns}/${name}: inspect before it exhausts backoffLimit — 'kubectl logs job/${name} -n ${ns}'"
+      any_issue=true
+    fi
+  done < <(echo "$jobs_json" | jq -c '.items[]' 2>/dev/null || true)
+
+  local cj_json
+  # shellcheck disable=SC2086
+  cj_json="$(kube get cronjobs $NS_FLAG -o json 2>/dev/null)" || cj_json='{"items":[]}'
+  while IFS= read -r cj; do
+    local ns name suspend
+    ns="$(echo "$cj" | jq -r '.metadata.namespace')"
+    name="$(echo "$cj" | jq -r '.metadata.name')"
+    suspend="$(echo "$cj" | jq -r '.spec.suspend // false')"
+    if [[ "$suspend" == "true" ]]; then
+      warn "CronJob ${ns}/${name}: suspended — it will not schedule new runs"
+      warn_rec "CronJob ${ns}/${name}: if unintended, resume it — 'kubectl patch cronjob ${name} -n ${ns} --type=merge -p {\"spec\":{\"suspend\":false}}'"
+      any_issue=true
+    fi
+  done < <(echo "$cj_json" | jq -c '.items[]' 2>/dev/null || true)
+
+  if [[ "$any_issue" == false ]]; then ok "Jobs/CronJobs: ${count} job(s) — no failures"; fi
+}
+
+# ── PodDisruptionBudgets ──────────────────────────────────────────────────────
+check_pdbs() {
+  section "PDBS"
+  local pdb_json count=0 any_issue=false
+  # shellcheck disable=SC2086
+  pdb_json="$(kube get pdb $NS_FLAG -o json 2>/dev/null)" || { info "PDB API unavailable"; return; }
+  count="$(echo "$pdb_json" | jq '.items | length')"
+  [[ "$count" -eq 0 ]] && { ok "No PodDisruptionBudgets in scope"; return; }
+
+  while IFS= read -r p; do
+    local ns name cur des allowed expected
+    ns="$(echo "$p" | jq -r '.metadata.namespace')"
+    name="$(echo "$p" | jq -r '.metadata.name')"
+    cur="$(echo "$p" | jq -r '.status.currentHealthy // 0')"
+    des="$(echo "$p" | jq -r '.status.desiredHealthy // 0')"
+    allowed="$(echo "$p" | jq -r '.status.disruptionsAllowed // 0')"
+    expected="$(echo "$p" | jq -r '.status.expectedPods // 0')"
+    if [[ "$cur" -lt "$des" ]]; then
+      critical "PDB ${ns}/${name}: only ${cur}/${des} healthy pods — protection breached, workload under-replicated"
+      critical_rec "PDB ${ns}/${name}: restore healthy pods — 'kubectl get pods -n ${ns}' and 'kubectl describe pdb ${name} -n ${ns}'"
+      any_issue=true
+    elif [[ "$expected" -gt 0 && "$allowed" -eq 0 ]]; then
+      warn "PDB ${ns}/${name}: 0 disruptions allowed — will block node drains / cluster upgrades"
+      warn_rec "PDB ${ns}/${name}: add replicas or relax minAvailable/maxUnavailable so a node can drain — 'kubectl describe pdb ${name} -n ${ns}'"
+      any_issue=true
+    fi
+  done < <(echo "$pdb_json" | jq -c '.items[]' 2>/dev/null || true)
+
+  if [[ "$any_issue" == false ]]; then ok "${count} PDB(s) satisfied — drains not blocked"; fi
+}
+
+# ── ResourceQuotas ────────────────────────────────────────────────────────────
+check_quotas() {
+  section "QUOTAS"
+  local rq_json count=0 any_issue=false
+  # shellcheck disable=SC2086
+  rq_json="$(kube get resourcequota $NS_FLAG -o json 2>/dev/null)" || { info "ResourceQuota API unavailable"; return; }
+  count="$(echo "$rq_json" | jq '.items | length')"
+  [[ "$count" -eq 0 ]] && { ok "No ResourceQuotas in scope"; return; }
+
+  while IFS= read -r rq; do
+    local ns name
+    ns="$(echo "$rq" | jq -r '.metadata.namespace')"
+    name="$(echo "$rq" | jq -r '.metadata.name')"
+    # Integer-valued resources (pods, object counts) compare cleanly; cpu/memory
+    # quantities need unit math and are intentionally skipped to avoid false ratios.
+    while IFS= read -r pair; do
+      local res pct
+      res="$(echo "$pair" | jq -r '.res')"
+      pct="$(echo "$pair" | jq -r '.pct')"
+      [[ "$pct" =~ ^[0-9]+$ ]] || continue
+      if [[ "$pct" -ge 100 ]]; then
+        critical "ResourceQuota ${ns}/${name}: ${res} at ${pct}% — new objects will be REJECTED"
+        critical_rec "ResourceQuota ${ns}/${name}: ${res} exhausted — raise the quota or free usage — 'kubectl describe resourcequota ${name} -n ${ns}'"
+        any_issue=true
+      elif [[ "$pct" -ge 90 ]]; then
+        warn "ResourceQuota ${ns}/${name}: ${res} at ${pct}%"
+        warn_rec "ResourceQuota ${ns}/${name}: ${res} nearly exhausted — plan capacity — 'kubectl describe resourcequota ${name} -n ${ns}'"
+        any_issue=true
+      fi
+    done < <(echo "$rq" | jq -c '
+      (.status.hard // {}) as $h | (.status.used // {}) as $u |
+      $h | to_entries[] |
+      select((.value|tostring|test("^[0-9]+$")) and (($u[.key] // "")|tostring|test("^[0-9]+$"))) |
+      {res: .key, pct: ((($u[.key]|tonumber) * 100) / (.value|tonumber) | floor)}' 2>/dev/null || true)
+  done < <(echo "$rq_json" | jq -c '.items[]' 2>/dev/null || true)
+
+  if [[ "$any_issue" == false ]]; then ok "${count} ResourceQuota(s) within limits"; fi
+}
+
+# ── Cluster DNS (CoreDNS / kube-dns) ──────────────────────────────────────────
+check_dns() {
+  section "DNS"
+  # DNS is cluster-wide infrastructure — always checked in kube-system regardless of scope.
+  local dep_json found=false any_issue=false
+  dep_json="$(kube get deploy -n kube-system -l k8s-app=kube-dns -o json 2>/dev/null)" || dep_json='{"items":[]}'
+  if [[ "$(echo "$dep_json" | jq '.items | length')" -eq 0 ]]; then
+    dep_json="$(kube get deploy -n kube-system -o json 2>/dev/null | jq '{items:[.items[] | select(.metadata.name | test("coredns|kube-dns"))]}' 2>/dev/null || echo '{"items":[]}')"
+  fi
+  while IFS= read -r d; do
+    found=true
+    local name des avail
+    name="$(echo "$d" | jq -r '.metadata.name')"
+    des="$(echo "$d" | jq -r '.spec.replicas // 0')"
+    avail="$(echo "$d" | jq -r '.status.availableReplicas // 0')"
+    if [[ "$des" -gt 0 && "$avail" -eq 0 ]]; then
+      critical "DNS ${name}: 0/${des} replicas available — cluster DNS is DOWN (every service lookup fails)"
+      critical_rec "DNS ${name}: restore CoreDNS immediately — 'kubectl get pods -n kube-system -l k8s-app=kube-dns' then describe the failing pods"
+      any_issue=true
+    elif [[ "$avail" -lt "$des" ]]; then
+      warn "DNS ${name}: ${avail}/${des} replicas available — resolution may be degraded/slow"
+      warn_rec "DNS ${name}: check CoreDNS pods — 'kubectl get pods -n kube-system -l k8s-app=kube-dns'"
+      any_issue=true
+    fi
+  done < <(echo "$dep_json" | jq -c '.items[]' 2>/dev/null || true)
+
+  if [[ "$found" == false ]]; then info "No CoreDNS/kube-dns deployment found in kube-system"; return; fi
+  if [[ "$any_issue" == false ]]; then ok "Cluster DNS healthy (CoreDNS available)"; fi
+}
+
+# ── Certificates (cert-manager) ───────────────────────────────────────────────
+check_certs() {
+  section "CERTS"
+  # cert-manager Certificates expose notAfter in .status — deterministic, no openssl.
+  local certs_json count=0 any_issue=false
+  # shellcheck disable=SC2086
+  certs_json="$(kube get certificates.cert-manager.io $NS_FLAG -o json 2>/dev/null)" \
+    || { info "cert-manager CRD not present — skipping certificate expiry check"; return; }
+  count="$(echo "$certs_json" | jq '.items | length')"
+  [[ "$count" -eq 0 ]] && { ok "No cert-manager Certificates in scope"; return; }
+
+  local now_s; now_s="$(date -u +%s)"
+  while IFS= read -r c; do
+    local ns name not_after ready exp_s days
+    ns="$(echo "$c" | jq -r '.metadata.namespace')"
+    name="$(echo "$c" | jq -r '.metadata.name')"
+    not_after="$(echo "$c" | jq -r '.status.notAfter // ""')"
+    ready="$(echo "$c" | jq -r '[.status.conditions[]? | select(.type=="Ready")][0].status // ""')"
+    if [[ "$ready" == "False" ]]; then
+      critical "Certificate ${ns}/${name}: not Ready — issuance/renewal failing"
+      critical_rec "Certificate ${ns}/${name}: 'kubectl describe certificate ${name} -n ${ns}' and check the referenced Issuer/ClusterIssuer"
+      any_issue=true
+    fi
+    if [[ -n "$not_after" ]]; then
+      exp_s="$(date -u -d "$not_after" +%s 2>/dev/null || echo 0)"   # GNU date; degrades gracefully elsewhere
+      if [[ "$exp_s" -gt 0 ]]; then
+        days=$(( (exp_s - now_s) / 86400 ))
+        if [[ "$days" -lt 0 ]]; then
+          critical "Certificate ${ns}/${name}: EXPIRED ${days#-} day(s) ago"
+          critical_rec "Certificate ${ns}/${name}: expired — trigger reissue ('kubectl cert-manager renew ${name} -n ${ns}' or delete the backing secret)"
+          any_issue=true
+        elif [[ "$days" -le 7 ]]; then
+          critical "Certificate ${ns}/${name}: expires in ${days} day(s)"
+          critical_rec "Certificate ${ns}/${name}: expiring imminently — verify cert-manager renewal — 'kubectl describe certificate ${name} -n ${ns}'"
+          any_issue=true
+        elif [[ "$days" -le 21 ]]; then
+          warn "Certificate ${ns}/${name}: expires in ${days} day(s)"
+          warn_rec "Certificate ${ns}/${name}: within the renewal window — confirm cert-manager will renew before expiry"
+          any_issue=true
+        fi
+      fi
+    fi
+  done < <(echo "$certs_json" | jq -c '.items[]' 2>/dev/null || true)
+
+  if [[ "$any_issue" == false ]]; then ok "${count} certificate(s) valid (Ready, >21 days to expiry)"; fi
+}
+
 # ── Pod deep-dive ─────────────────────────────────────────────────────────────
 pod_deepdive() {
   local pod="$1"
@@ -1873,6 +2102,11 @@ main() {
     check_resources
     check_pvcs
     check_hpas
+    check_jobs
+    check_pdbs
+    check_quotas
+    check_dns
+    check_certs
     _finalize_sections
     if [[ "$HTML_MODE" == true ]]; then
       emit_html  # exits internally with correct code
@@ -1919,6 +2153,11 @@ main() {
   check_resources
   check_pvcs
   check_hpas
+  check_jobs
+  check_pdbs
+  check_quotas
+  check_dns
+  check_certs
 
   exec 1>&3             # restore stdout
   exec 3>&-             # close saved fd
