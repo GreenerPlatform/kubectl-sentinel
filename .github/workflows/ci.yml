@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  lint-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Syntax check
+        run: |
+          bash -n kubectl-sentinel
+          bash -n install.sh
+
+      - name: ShellCheck
+        run: shellcheck --severity=error kubectl-sentinel install.sh
+
+      - name: Smoke test (no cluster required)
+        run: |
+          chmod +x kubectl-sentinel
+          ./kubectl-sentinel --version
+          ./kubectl-sentinel --help >/dev/null

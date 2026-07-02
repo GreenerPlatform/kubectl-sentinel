@@ -3,6 +3,7 @@
 </div>
 
 <div align="center">
+  <img src="https://img.shields.io/github/actions/workflow/status/GreenerPlatform/kubectl-sentinel/ci.yml?style=flat-square&label=CI" alt="CI"/>
   <img src="https://img.shields.io/badge/shell-bash-4EAA25?style=flat-square&logo=gnu-bash&logoColor=white" alt="bash"/>
   <img src="https://img.shields.io/badge/kubectl-plugin-326CE5?style=flat-square&logo=kubernetes&logoColor=white" alt="kubectl plugin"/>
   <img src="https://img.shields.io/badge/output-JSON%20%7C%20text%20%7C%20HTML-lightgrey?style=flat-square" alt="output formats"/>

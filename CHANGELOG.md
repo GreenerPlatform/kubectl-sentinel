@@ -7,6 +7,16 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [1.1.1] — 2026-07-02
+
+### Fixed
+- HTML report (`--output-format html`) now resolves the kubeconfig context through the same `--context`-aware wrapper as text and JSON output, instead of always reading the active context
+
+### Added
+- GitHub Actions CI: ShellCheck, `bash -n` syntax check, and a no-cluster smoke test (`--version`, `--help`) on every push and pull request
+
+---
+
 ## [1.1.0] — 2026-04-11
 
 ### Added

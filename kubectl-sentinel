@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # kubectl-sentinel — Kubernetes cluster health checker
-# Version: 1.1.0
+# Version: 1.1.1
 # Usage: kubectl sentinel [-n namespace] [pod/<name>] [node/<name>] [--json] [--no-color]
 # Requires: kubectl, jq
-TOOL_VERSION="1.1.0"
+TOOL_VERSION="1.1.1"
 
 set -euo pipefail
 
@@ -540,7 +540,7 @@ emit_html() {
   [[ "$CRITICAL_COUNT" -gt 0 ]] && exit_code=2 || { [[ "$WARN_COUNT" -gt 0 ]] && exit_code=1; }
 
   local ctx scope_str generated_at
-  ctx="${CONTEXT:-$(kubectl config current-context 2>/dev/null || echo 'unknown')}"
+  ctx="${CONTEXT:-$(kube config current-context 2>/dev/null || echo 'unknown')}"
   if [[ -n "$NAMESPACE" ]]; then scope_str="namespace: $NAMESPACE"
   else scope_str="all namespaces"; fi
   generated_at="$(ts)"
