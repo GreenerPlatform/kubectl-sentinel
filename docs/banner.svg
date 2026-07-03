@@ -1,16 +1,16 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 140" width="900" height="140">
-  <rect width="900" height="140" rx="12" fill="#0d1117"/>
-  <rect x="0" y="0" width="6" height="140" rx="3" fill="#326CE5"/>
-  <!-- Kubernetes-style 6-spoke wheel (SVG paths, no Unicode) -->
-  <g transform="translate(56,70)">
-    <circle r="9" fill="#326CE5"/>
-    <rect x="-3.5" y="-30" width="7" height="21" rx="3.5" fill="#326CE5"/>
-    <rect x="-3.5" y="-30" width="7" height="21" rx="3.5" fill="#326CE5" transform="rotate(60)"/>
-    <rect x="-3.5" y="-30" width="7" height="21" rx="3.5" fill="#326CE5" transform="rotate(120)"/>
-    <rect x="-3.5" y="-30" width="7" height="21" rx="3.5" fill="#326CE5" transform="rotate(180)"/>
-    <rect x="-3.5" y="-30" width="7" height="21" rx="3.5" fill="#326CE5" transform="rotate(240)"/>
-    <rect x="-3.5" y="-30" width="7" height="21" rx="3.5" fill="#326CE5" transform="rotate(300)"/>
+  <rect width="900" height="140" rx="14" fill="#F4F1EC"/>
+  <rect x="0" y="0" width="6" height="140" rx="3" fill="#1E6E52"/>
+  <!-- GreenerPlatform mark -->
+  <g transform="translate(30,27) scale(0.68)">
+    <rect x="8" y="8" width="112" height="112" rx="28" fill="#1E6E52"/>
+    <g fill="none" stroke="#F4F1EC" stroke-width="7" stroke-linecap="round" opacity="0.28">
+      <line x1="36" y1="86" x2="92" y2="86"/><line x1="36" y1="98" x2="78" y2="98"/>
+    </g>
+    <path d="M32 60 L52 80 L74 54" fill="none" stroke="#F4F1EC" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M74 54 C 78 34, 96 28, 104 30 C 104 46, 92 58, 74 54 Z" fill="#F4F1EC"/>
+    <path d="M84 48 C 90 42, 96 38, 101 35" fill="none" stroke="#1E6E52" stroke-width="3" stroke-linecap="round"/>
   </g>
-  <text x="96" y="78" font-family="'Courier New',Courier,monospace" font-size="44" font-weight="700" fill="#f0f6fc">kubectl-sentinel</text>
-  <text x="98" y="112" font-family="'Courier New',Courier,monospace" font-size="15" fill="#8b949e">10-section Kubernetes health checker · the fix, not just the finding</text>
+  <text x="140" y="72" font-family="'Poppins','Segoe UI',system-ui,sans-serif" font-size="40" font-weight="700" fill="#16181D">kubectl-sentinel</text>
+  <text x="142" y="104" font-family="'JetBrains Mono','Courier New',monospace" font-size="15" fill="#4A4E57">15 health dimensions · every finding ships with the fix · JSON · CI-safe</text>
 </svg>

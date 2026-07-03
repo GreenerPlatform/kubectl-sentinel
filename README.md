@@ -19,7 +19,7 @@ Cluster issues show up as alerts — not root causes. You get paged for a pod
 CrashLoopBackOff when the real cause is a missing secret that took down 11
 deployments. Standard tooling tells you *what* failed, not *why*.
 
-> **One command. Ten health dimensions. The fix, not just the finding.**
+> **One command. 15 health dimensions. Every finding ships with the fix command.**
 
 ```bash
 kubectl sentinel -n payments
@@ -209,5 +209,4 @@ Separating them means each layer is independently testable, portable, and compos
 
 Issues and pull requests welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Design rule: *build for the 3am reader* — every output line is written as if the reader
-has been awake for 3 hours and needs to act in 5 minutes.
+Design rule: every output line names the finding and the command that resolves it.

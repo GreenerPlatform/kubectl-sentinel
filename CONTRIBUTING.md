@@ -13,7 +13,7 @@ kubectl sentinel -n default
 
 ## Design principles
 
-- **Build for the 3am reader** — every output line is written as if the reader has been awake for 3 hours and needs to act in 5 minutes
+- **Every finding carries its fix** — a finding without an actionable next command is incomplete
 - **Exit codes are a public API** — never change what an exit code means without bumping the major version; CI pipelines depend on them
 - **Name the evidence** — "FailedMount: Secret `auth-tokens` missing" beats "mount error detected"
 - **Classify before recommending** — OOMKill does not always mean "raise the limit"; the recommendation must follow the classification
