@@ -7,6 +7,21 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [1.2.1] — 2026-07-03
+
+### Changed
+- Relicensed to **Apache-2.0** (patent grant + attribution); added `NOTICE`, `TRADEMARKS.md`, and SPDX headers. Copyright standardized to Olawale Ogundiran.
+- Docs are vendor-neutral: the reasoning layer is described as "any AI agent (via MCP or a reference skill)" rather than Claude-specific.
+
+### Added
+- **Krew** distribution: `.krew.yaml` plugin manifest and a tag-triggered release workflow — `kubectl krew install sentinel`.
+- **Homebrew** formula template under `packaging/homebrew/`.
+- `Documentation voice` standard in `CONTRIBUTING.md`.
+
+_No behavioural change to the checks._
+
+---
+
 ## [1.2.0] — 2026-07-03
 
 ### Added — five new deterministic checks (single-`kubectl` snapshot, no new dependencies)

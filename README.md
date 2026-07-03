@@ -45,8 +45,13 @@ Summary: 2 CRITICAL · 2 WARN · 8 OK
 ## Install
 
 ```bash
-bash install.sh          # installs to ~/bin
-bash install.sh /usr/local/bin  # custom path
+# krew (recommended — kubectl's plugin manager)
+kubectl krew install sentinel
+kubectl sentinel
+
+# or from source
+git clone https://github.com/GreenerPlatform/kubectl-sentinel
+cd kubectl-sentinel && bash install.sh /usr/local/bin
 ```
 
 **Requirements:** `kubectl` in PATH · `jq` in PATH · a valid kubeconfig
@@ -161,10 +166,16 @@ kubectl-sentinel collects the cluster state in under 10 seconds. incident-triage
 the alert, scores each sentinel finding by relevance, and outputs a root cause, causation
 chain, and P1 command — sourced directly from the `recommendation` field in the sentinel JSON.
 
-## Claude Code skill
+## Using it from an AI agent (any runtime)
 
-The skill definition lives at [`skills/SKILL.md`](skills/SKILL.md). To use `/sentinel`
-in any Claude Code project, copy it to `.claude/commands/sentinel.md`:
+Two paths, both vendor-neutral:
+
+**1. MCP server (recommended).** The [GreenerPlatform MCP server](https://github.com/GreenerPlatform)
+exposes `sentinel` as a tool to any MCP client — Cursor, Claude Desktop, VS Code, Windsurf,
+or a custom agent. Install once; it works everywhere.
+
+**2. Reference agent skill.** [`skills/SKILL.md`](skills/SKILL.md) is a reference reasoning-layer
+integration (a Claude Code command). Copy it into your agent's command directory:
 
 ```bash
 cp skills/SKILL.md /path/to/your-project/.claude/commands/sentinel.md
@@ -176,8 +187,8 @@ cp skills/SKILL.md /path/to/your-project/.claude/commands/sentinel.md
 /sentinel node/worker-1
 ```
 
-The skill uses kubectl-sentinel as its primary data source and adds reasoning — correlating
-a FailedMount to all deployments blocked by the same missing secret, and distinguishing an
+The reasoning layer reads the JSON and explains *why* findings matter — correlating a
+FailedMount to every deployment blocked by the same missing secret, and distinguishing an
 OOMKill that needs a higher limit from one that signals a memory leak.
 
 ## Why the dual-layer pattern
@@ -186,10 +197,9 @@ kubectl-sentinel is the deterministic layer: it collects cluster state, applies 
 rules, and emits structured output in under 10 seconds. It works at 3am in CI with no
 internet access and no external dependencies.
 
-The `/sentinel` Claude Code skill is the reasoning layer: it reads the JSON output and
-explains *why* findings matter — correlating a FailedMount event to the 11 deployments
-that depend on the missing secret, or explaining that an OOMKill at the memory limit
-boundary may indicate a memory leak rather than an undersized limit.
+The reasoning layer (an agent, via MCP or the reference skill) reads that JSON and explains
+*why* findings matter. It is bounded by the evidence the CLI collected — it reasons over
+facts, it does not guess at cluster state.
 
 Separating them means each layer is independently testable, portable, and composable.
 

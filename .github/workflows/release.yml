@@ -1,0 +1,47 @@
+name: release
+
+# On a version tag: build the release archive, attach it to the GitHub Release,
+# and open a PR to the krew-index so `kubectl krew upgrade sentinel` picks it up.
+#
+# First-time setup (once): submit .krew.yaml to https://github.com/kubernetes-sigs/krew-index
+# manually. After that, this workflow keeps it updated on every tag.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release archive
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          archive="kubectl-sentinel-${tag}.tar.gz"
+          tr -d '\r' < kubectl-sentinel > kubectl-sentinel.clean
+          mv kubectl-sentinel.clean kubectl-sentinel
+          chmod +x kubectl-sentinel
+          tar -czf "$archive" kubectl-sentinel LICENSE NOTICE
+          sha256sum "$archive" | tee "$archive.sha256"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            kubectl-sentinel-*.tar.gz
+            kubectl-sentinel-*.tar.gz.sha256
+
+  krew:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update krew-index
+        uses: rajatjindal/krew-release-bot@v0.0.47
+        with:
+          krew_template_file: .krew.yaml

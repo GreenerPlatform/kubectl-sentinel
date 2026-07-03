@@ -1,0 +1,34 @@
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: sentinel
+spec:
+  version: {{ .TagName }}
+  homepage: https://github.com/GreenerPlatform/kubectl-sentinel
+  shortDescription: Deterministic cluster health snapshot for triage
+  description: |
+    kubectl-sentinel collects a structured, severity-ranked snapshot of cluster
+    health across 15 dimensions (pods, workloads, events, jobs, PDBs, quotas,
+    DNS, certs, and more) in under 10 seconds. Output is text, JSON, or HTML.
+
+    It is deterministic: same cluster state in, same findings out. No LLM, no
+    network calls, no external dependencies beyond kubectl and jq. Built as the
+    evidence layer an AI agent can reason over without guessing.
+  caveats: |
+    Requires 'kubectl' and 'jq' on your PATH.
+    This plugin is a POSIX shell script; Linux and macOS are supported.
+  platforms:
+    - selector:
+        matchExpressions:
+          - key: os
+            operator: In
+            values: [darwin, linux]
+      {{addURIAndSha "https://github.com/GreenerPlatform/kubectl-sentinel/releases/download/{{ .TagName }}/kubectl-sentinel-{{ .TagName }}.tar.gz" .TagName }}
+      bin: kubectl-sentinel
+      files:
+        - from: kubectl-sentinel
+          to: .
+        - from: LICENSE
+          to: .
+        - from: NOTICE
+          to: .

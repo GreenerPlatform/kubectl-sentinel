@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Olawale Ogundiran
 # kubectl-sentinel — Kubernetes cluster health checker
-# Version: 1.2.0
+# Version: 1.2.1
 # Usage: kubectl sentinel [-n namespace] [pod/<name>] [node/<name>] [--json] [--no-color]
 # Requires: kubectl, jq
-TOOL_VERSION="1.2.0"
+TOOL_VERSION="1.2.1"
 
 set -euo pipefail
 

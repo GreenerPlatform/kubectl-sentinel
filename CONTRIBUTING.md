@@ -51,3 +51,14 @@ Each check section follows the same pattern:
 4. Accumulate CRITICAL/WARN counts into the global summary
 
 See an existing section (e.g. PODS or HPAS) as a reference implementation.
+
+## Documentation voice
+
+Docs represent production reliability engineering. Keep them firm and clean.
+
+- Lead with the fact, not the feeling. State what it does and the number that proves it.
+- Every claim is verifiable — a command, an exit code, a measurement — or it is cut.
+- Second person, present tense, active voice. Short sentences.
+- Do not use: leverage, robust, seamless, powerful, effortless, delve, game-changing,
+  cutting-edge, supercharge, unlock, revolutionary, world-class, "in today's ...".
+- No "it's not just X, it's Y" constructions. No emoji in prose.
