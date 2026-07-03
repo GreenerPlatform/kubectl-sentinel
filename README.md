@@ -162,7 +162,7 @@ kubectl sentinel --json -n payments > snap.json
 incident-triage --sentinel-json snap.json --alert "payments API 503 since 14:30"
 ```
 
-kubectl-sentinel collects the cluster state in under 10 seconds. incident-triage classifies
+kubectl-sentinel collects the cluster state in a single pass. incident-triage classifies
 the alert, scores each sentinel finding by relevance, and outputs a root cause, causation
 chain, and P1 command — sourced directly from the `recommendation` field in the sentinel JSON.
 
@@ -194,8 +194,8 @@ OOMKill that needs a higher limit from one that signals a memory leak.
 ## Why the dual-layer pattern
 
 kubectl-sentinel is the deterministic layer: it collects cluster state, applies severity
-rules, and emits structured output in under 10 seconds. It works at 3am in CI with no
-internet access and no external dependencies.
+rules, and emits structured output in a single pass. It runs in CI with no external
+dependencies — no internet calls, no SaaS, no LLM in the loop.
 
 The reasoning layer (an agent, via MCP or the reference skill) reads that JSON and explains
 *why* findings matter. It is bounded by the evidence the CLI collected — it reasons over
