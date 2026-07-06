@@ -11,6 +11,8 @@
   <img src="https://img.shields.io/github/license/GreenerPlatform/kubectl-sentinel?style=flat-square" alt="license"/>
 </div>
 
+<p align="center"><em>The deterministic evidence layer for AI-assisted reliability — the same findings every time, each paired with the command that proves and fixes it.</em></p>
+
 ---
 
 ## Why Kubernetes Health Checks Fail
