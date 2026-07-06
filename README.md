@@ -68,7 +68,7 @@ kubectl sentinel --context <name> -n <ns> # context + namespace scope
 kubectl sentinel pod/<name>               # pod deep-dive
 kubectl sentinel pod/<name> -n <ns>       # pod deep-dive in specific namespace
 kubectl sentinel node/<name>              # node deep-dive
-kubectl sentinel --json                   # JSON output (schema v1.0)
+kubectl sentinel --json                   # JSON output (schema v1.1)
 kubectl sentinel --json -n <namespace>    # JSON output (scoped)
 kubectl sentinel --no-color               # plain text (no ANSI)
 kubectl sentinel --verbose                # full per-pod/per-node detail
@@ -102,7 +102,7 @@ PODS also flags containers with **no CPU request** (WARN); WORKLOADS also flags 
 |------|-------------|
 | `-n <namespace>` | Scope all checks to one namespace |
 | `--context <name>` | Use a specific kubeconfig context without changing the active one |
-| `--json` | Emit findings as structured JSON (schema v1.0) to stdout |
+| `--json` | Emit findings as structured JSON (schema v1.1) to stdout |
 | `--no-color` | Disable ANSI colour output |
 | `--verbose` | Expand all grouped findings; remove WARN recommendation cap |
 | `-h`, `--help` | Show usage |
@@ -128,7 +128,7 @@ Emits a single JSON object to stdout. Errors go to stderr. Safe for pipes and re
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "generated_at": "<ISO8601>",
   "context": "<context name>",
   "scope": "all namespaces | namespace: <name>",
@@ -139,6 +139,7 @@ Emits a single JSON object to stdout. Errors go to stderr. Safe for pipes and re
       "section": "PODS",
       "findings": [
         {
+          "id": "POD-CRASHLOOP",
           "severity": "CRITICAL",
           "message": "<finding>",
           "recommendation": "kubectl rollout restart deploy/...",
@@ -149,6 +150,11 @@ Emits a single JSON object to stdout. Errors go to stderr. Safe for pipes and re
   ]
 }
 ```
+
+Each finding carries a **stable `id`** (e.g. `POD-CRASHLOOP`, `PDB-BREACHED`) — a durable
+handle for a finding *type* that stays constant across runs even if the message is reworded.
+Use it to reference, group, suppress, or correlate findings, and as a typed key for an AI/agent
+to reason over instead of parsing message text.
 
 `--json` is not supported for `pod/<name>` or `node/<name>` deep-dive modes.
 

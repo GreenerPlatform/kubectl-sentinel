@@ -7,6 +7,22 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [1.3.0] — 2026-07-06
+
+### Added — stable check IDs
+- Every finding now carries a **stable check id** (e.g. `POD-CRASHLOOP`, `PDB-BREACHED`, `POD-NO-CPU-REQUEST`) — a durable handle for a finding *type* that stays constant across runs even if the human-readable message is reworded. IDs make findings referenceable, greppable, suppressible, and correlatable over time, and give an AI/agent a typed key to reason over instead of parsing message text.
+- **JSON**: each finding gains an `id` field (first key). `schema_version` bumped **1.0 → 1.1** (additive — existing consumers ignore the new field).
+- **Text**: a new `Check` column sits between `Severity` and `Finding`. Deep-dive (`pod/`, `node/`) mode prints the id inline after the severity tag.
+- **HTML**: a new `Check` column shows the id in monospace.
+
+### Fixed
+- Progress spinner now animates **only when stderr is an interactive terminal**. Previously, piping or redirecting output (e.g. `| tee`, `> log`, CI capture) flooded the stream with thousands of `\r`-based `Collecting cluster data…` lines. Non-interactive runs are now silent on stderr.
+
+### Notes
+- Purely additive; exit-code semantics unchanged. `incident-triage` ≥ 1.3.2 recognises `schema_version` 1.1; older versions still work (they emit a harmless schema-version notice).
+
+---
+
 ## [1.2.1] — 2026-07-03
 
 ### Changed
