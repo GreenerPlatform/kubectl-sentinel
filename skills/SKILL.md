@@ -3,7 +3,7 @@ name: sentinel
 description: >
   Kubernetes cluster health checker — nodes, pods, workloads, services, probes,
   events, resources, PVCs, HPAs. Run /sentinel to observe cluster state, identify
-  CRITICALs, and get ranked kubectl remediation commands. Use for incident triage,
+  CRITICALs, and get ranked, reviewable next steps. Use for incident triage,
   pre-deploy checks, or routine health review.
 compatibility: Requires kubectl and jq. kubectl-sentinel script must be installed
   (run `bash install.sh ~/bin` from the kubectl-sentinel repo) for the primary data path.
@@ -15,7 +15,7 @@ allowed-tools: Bash(kubectl-sentinel:*) mcp__kubernetes__kubectl_context mcp__ku
 ## Argument parsing
 
 - Empty → full cluster check, all namespaces
-- `-n <namespace>` → scope all checks to that namespace
+- `-n <namespace>` → scope namespaced collectors; nodes, node resources, and DNS remain cluster-wide
 - `--context <name>` → target a specific kubeconfig context without switching the active one
 - `pod/<name>` (optionally with `-n <namespace>`) → deep-dive on that specific pod
 - `node/<name>` → deep-dive on that specific node
@@ -160,7 +160,7 @@ mcp__kubernetes__kubectl_generic(command="top", resourceType="node", name="<name
 
 ### Pods
 - `Failed` phase → CRITICAL; CrashLoopBackOff → CRITICAL (restart count, exit code)
-- OOMKilled → CRITICAL (container name, memory limit); ImagePullBackOff → CRITICAL (image name)
+- OOMKilled → CRITICAL (container name, memory limit); ImagePullBackOff / ErrImagePull → WARN (image name)
 - `CreateContainerConfigError` → CRITICAL (name the secret/configmap from events)
 - Restart count > 50 → CRITICAL; > 10 → WARN; Pending → WARN (extract scheduler reason)
 
@@ -181,15 +181,16 @@ mcp__kubernetes__kubectl_generic(command="top", resourceType="node", name="<name
 - CPU/Memory ≥ 95% → CRITICAL; ≥ 85% → WARN
 
 ### PVCs
-- `Pending` or `Lost` → CRITICAL; `Released` → WARN
+- `Pending` or `Lost` → CRITICAL
 
 ### HPAs
 - `minReplicas == maxReplicas` → WARN; `currentReplicas == maxReplicas` → WARN
 
-### Root cause correlation
-- FailedMount secret + ≥3 pods Pending → surface secret name directly
-- ≥3 nodes Rebooted + ≥5 pods Pending → likely node pool upgrade
-- Node NotReady + OOMKilling events → kubelet OOMKill cascade; parse `anon-rss` to find largest consumer
+### Correlation hypotheses
+- FailedMount secret + ≥3 pods Pending → surface the shared missing dependency
+- ≥3 nodes Rebooted + ≥5 pods Pending → possible node-pool activity; verify change history
+- Node NotReady + OOMKilling events → possible memory-pressure cascade; rank observed
+  `anon-rss` values but do not claim the largest event caused node failure
 
 ---
 
@@ -197,8 +198,9 @@ mcp__kubernetes__kubectl_generic(command="top", resourceType="node", name="<name
 
 ### Analysis standards
 
-- **Group by impact** — "entire payments stack is down — 5 deployments at 0 replicas, root cause: Secret `db-credentials` missing" not a list of each pod
-- **Name the root cause** — when one secret/image/crash explains many failures, state it once
+- **Group by impact** — summarize the affected workloads instead of listing every pod
+- **Label hypotheses** — call a shared secret, image, or crash a candidate cause until
+  dependency and timing evidence verify causation
 - **Assess blast radius** — for each CRITICAL, note user-visible impact
 - **Surface correlated findings** — FailedGetResourceMetric + HPAs at ceiling → same problem
 - **Cross-namespace blast radius** — OOMKill or NotReady may originate outside the scoped namespace; flag it
@@ -217,8 +219,8 @@ Source  : kubectl-sentinel --json | direct kubectl
   [CRITICAL] <first critical recommendation>
   ...
 
-━━ ROOT CAUSE ANALYSIS ━━    ← only if a correlated pattern was found
-  [PATTERN] / [LIKELY] / [ACTION]
+━━ CORRELATION HYPOTHESIS ━━    ← only if a correlated pattern was found
+  [PATTERN] / [CANDIDATE] / [VERIFY]
 
 ━━ NODES ━━      ━━ PODS ━━      ━━ PROBES ━━     ━━ WORKLOADS ━━
 ━━ HTTP ━━       ━━ gRPC ━━      ━━ EVENTS ━━     ━━ RESOURCES ━━
@@ -229,7 +231,7 @@ Source  : kubectl-sentinel --json | direct kubectl
 ━━ RECOMMENDATIONS ━━
 | # | Severity | Recommendation |
 |---|----------|----------------|
-| 1 | CRITICAL | <action with concrete kubectl command> |
+| 1 | CRITICAL | <reviewable next step; label mutating commands explicitly> |
 
 ━━ SUMMARY ━━
 | Severity | Count |

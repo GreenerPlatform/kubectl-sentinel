@@ -1,20 +1,23 @@
 # Trademark & attribution policy
 
-The **code** in this repository is licensed under Apache-2.0 (see `LICENSE`). You are
-free to use, modify, and redistribute it, including commercially, provided you keep the
-copyright and `NOTICE`.
+The code is licensed under Apache-2.0. Redistribution obligations are defined by
+[`LICENSE`](LICENSE) and [`NOTICE`](NOTICE); this summary does not replace those terms.
 
-The **names and brand are not part of that grant.** The following are trademarks of
-Olawale Ogundiran:
+The project claims trademark rights in:
 
 - **GreenerPlatform** (the project and organization name)
 - **kubectl-sentinel** (this tool's name)
 - The **GreenerPlatform logo** and the "Engineer's Sketchbook" visual identity
 
-What this means in practice:
+Apache-2.0 grants no trademark license beyond reasonable and customary descriptive use.
+In practice:
 
-- **You may** state that your work "uses" or "is based on" kubectl-sentinel / GreenerPlatform, and reproduce the `NOTICE` for attribution.
-- **You may not** name a fork or derivative "GreenerPlatform" or "kubectl-sentinel", use the logo, or otherwise present your work in a way that implies it is the official project or endorsed by it. Rename and re-brand your fork.
+- You may accurately state that a work uses or is based on kubectl-sentinel or
+  GreenerPlatform.
+- You must not use project names or branding in a way that implies sponsorship,
+  endorsement, or official status.
+- Derivatives should use a distinct name and visual identity unless written permission
+  has been granted.
 
-This protects users from confusion and keeps credit with the original author, while
-leaving the code fully open. Questions or permission requests: open an issue.
+Seek legal advice for proposed branding uses. Questions or permission requests: open an
+issue.

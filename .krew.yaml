@@ -9,20 +9,20 @@ spec:
   description: |
     kubectl-sentinel collects a structured, severity-ranked snapshot of cluster
     health across 15 dimensions (pods, workloads, events, jobs, PDBs, quotas,
-    DNS, certs, and more) in under 10 seconds. Output is text, JSON, or HTML.
+    DNS, certs, and more). Output is text, JSON, or HTML.
 
-    It is deterministic: same cluster state in, same findings out. No LLM, no
-    network calls, no external dependencies beyond kubectl and jq. Built as the
-    evidence layer an AI agent can reason over without guessing.
+    Rule-based classifications are reproducible for equivalent captured inputs
+    and tool versions. The plugin makes no direct SaaS or LLM calls; kubectl
+    contacts the selected Kubernetes API.
   caveats: |
-    Requires 'kubectl' and 'jq' on your PATH.
-    This plugin is a POSIX shell script; Linux and macOS are supported.
+    Requires Bash, kubectl, jq, and standard Unix utilities on your PATH.
+    Linux is the currently validated platform.
   platforms:
     - selector:
         matchExpressions:
           - key: os
             operator: In
-            values: [darwin, linux]
+            values: [linux]
       {{addURIAndSha "https://github.com/GreenerPlatform/kubectl-sentinel/releases/download/{{ .TagName }}/kubectl-sentinel-{{ .TagName }}.tar.gz" .TagName }}
       bin: kubectl-sentinel
       files:

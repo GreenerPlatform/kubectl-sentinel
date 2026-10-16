@@ -3,7 +3,7 @@ name: sentinel
 description: >
   Kubernetes cluster health checker — nodes, pods, workloads, services, probes,
   events, resources, PVCs, HPAs. Run /sentinel to observe cluster state, identify
-  CRITICALs, and get ranked kubectl remediation commands. Use for incident triage,
+  CRITICALs, and get ranked, reviewable next steps. Use for incident triage,
   pre-deploy checks, or routine health review.
 compatibility: Requires kubectl and jq. kubectl-sentinel script must be installed
   (run `bash install.sh ~/bin` from the kubectl-sentinel repo) for the primary data path.
@@ -15,7 +15,7 @@ allowed-tools: Bash(kubectl-sentinel:*) mcp__kubernetes__kubectl_context mcp__ku
 ## Argument parsing
 
 - Empty → full cluster check, all namespaces
-- `-n <namespace>` → scope all checks to that namespace
+- `-n <namespace>` → scope namespaced collectors; nodes, node resources, and DNS remain cluster-wide
 - `--context <name>` → target a specific kubeconfig context without switching the active one
 - `pod/<name>` (optionally with `-n <namespace>`) → deep-dive on that specific pod
 - `node/<name>` → deep-dive on that specific node
@@ -198,7 +198,7 @@ Apply these rules to the data from Phase 1b. Skip if Phase 1a produced valid JSO
 - Phase `Failed` → CRITICAL
 - CrashLoopBackOff → CRITICAL (restart count, last exit code)
 - OOMKilled → CRITICAL (container name, memory limit)
-- ImagePullBackOff / ErrImagePull → CRITICAL (include image name)
+- ImagePullBackOff / ErrImagePull → WARN (include image name)
 - `CreateContainerConfigError` → CRITICAL (missing Secret or ConfigMap — name it from events)
 - Restart count > 50 → CRITICAL (individual); > 10 → WARN
 - Pending → WARN (extract scheduler reason; never leave blank)
@@ -234,17 +234,19 @@ Apply these rules to the data from Phase 1b. Skip if Phase 1a produced valid JSO
 
 ### 9. PVCs
 - `Pending` or `Lost` → CRITICAL
-- `Released` → WARN
 
 ### 10. HPAs
 - `minReplicas == maxReplicas` → WARN (cannot autoscale)
 - `currentReplicas == maxReplicas` → WARN (at ceiling)
 
-### 11. Root cause correlation
-After all checks, look for patterns and emit a ROOT CAUSE ANALYSIS block if found:
-- **Node pool upgrade + pending pods:** ≥3 nodes with Rebooted events AND ≥5 pods Pending → likely upgrade in progress; if a FailedMount secret was also found, name it and give a 3-step action plan
-- **Missing secret + pending pods:** FailedMount secret identified AND ≥3 pods Pending → surface the secret name directly
-- **OOM cascade → kubelet death:** Node is NotReady AND has OOMKilling events → the kubelet itself was OOMKilled. Identify the single largest OOM event by parsing `anon-rss` from OOMKill event messages — that process is the root cause, not the downstream victims. Name it explicitly. Note whether the root cause is in a different namespace than the scope of the current check.
+### 11. Correlation hypotheses
+After all checks, surface correlated patterns without presenting them as causal proof:
+- **Node activity + pending pods:** ≥3 nodes with Rebooted events AND ≥5 pods Pending →
+  possible node-pool activity; verify change history
+- **Missing secret + pending pods:** FailedMount secret identified AND ≥3 pods Pending →
+  surface the shared missing dependency
+- **Node NotReady + OOM signals:** rank observed `anon-rss` values as evidence candidates.
+  Do not claim that the largest event caused node failure without node logs and timing.
 
 ---
 
@@ -252,9 +254,12 @@ After all checks, look for patterns and emit a ROOT CAUSE ANALYSIS block if foun
 
 ### Analysis quality standards
 
-**Group by impact, not by resource.** Rather than listing every failing pod individually, state the namespace-level impact: "entire payments stack is down — 5 deployments at 0 replicas, root cause: Secret `db-credentials` missing."
+**Group by impact, not by resource.** Summarize the affected workloads instead of listing
+every failing pod individually.
 
-**Name the root cause explicitly.** When a missing Secret, wrong image tag, or crashed dependency explains multiple failures, state it once at the top of that namespace's finding.
+**Label causal claims.** When a missing Secret, wrong image tag, or crashed dependency
+correlates with multiple failures, state it as a candidate cause until dependency and
+timing evidence verify causation.
 
 **Distinguish stable vs unstable failures.** A pod with 67 restarts in CrashLoopBackOff is more urgent than one with 11.
 
@@ -262,7 +267,8 @@ After all checks, look for patterns and emit a ROOT CAUSE ANALYSIS block if foun
 
 **Surface correlated findings.** If FailedGetResourceMetric events are high AND multiple HPAs are at max ceiling, both are consequences of the same metric collection problem — say so.
 
-**Cross-namespace blast radius.** When a namespace-scoped check shows nodes going NotReady or OOMKilling, the root cause may be a pod in a *different* namespace sharing the same node. Flag this explicitly.
+**Cross-namespace blast radius.** When a namespace-scoped check shows nodes going NotReady
+or OOMKilling, related evidence may be outside the namespace. Flag the evidence gap.
 
 **Do not pad.** If nodes are clean, say `[OK] All N nodes Ready — no pressure, no cordoned nodes, uniform v1.33.5, resource usage within limits.` One sentence. Do not enumerate every node.
 
@@ -280,10 +286,10 @@ Source  : kubectl-sentinel --json | direct kubectl
   [CRITICAL] <second critical recommendation>
   ... (up to 5; "... and N more — see RECOMMENDATIONS")
 
-━━ ROOT CAUSE ANALYSIS ━━    ← only if a correlated pattern was found
+━━ CORRELATION HYPOTHESIS ━━    ← only if a correlated pattern was found
   [PATTERN] ...
-  [LIKELY]  ...
-  [ACTION]  1. ...
+  [CANDIDATE] ...
+  [VERIFY]  1. ...
             2. ...
             3. ...
 ```
@@ -323,7 +329,7 @@ Followed by 10 sections, always in this order, always present:
 |----------|-------------------|------|---------|
 | CRITICAL | payments/api-svc | 8080 | No endpoints — selector may not match pods |
 | WARN     | frontend/web-svc | 80 | 2 endpoint(s) not ready |
-| OK       | — | All HTTP services healthy |
+| OK       | — | Candidate HTTP services have ready endpoint addresses |
 
 ━━ gRPC ━━
 | Severity | Namespace/Service | Port | Finding |
@@ -359,7 +365,7 @@ Followed by 10 sections, always in this order, always present:
 ━━ RECOMMENDATIONS ━━
 | # | Severity | Recommendation |
 |---|----------|----------------|
-| 1 | CRITICAL | payments: create missing Secret `db-credentials` — `kubectl get secret db-credentials -n payments` then recreate from vault/pipeline and run `kubectl rollout restart deployment -n payments` |
+| 1 | CRITICAL | payments: verify the missing Secret `db-credentials` — `kubectl get secret db-credentials -n payments`; review any remediation with the workload owner |
 | 2 | WARN | backend workers: check crash cause — `kubectl logs <pod> -n backend --previous` |
 
 ━━ SUMMARY ━━
@@ -378,7 +384,9 @@ Followed by 10 sections, always in this order, always present:
 - **Grouped findings** — one row per group, not one row per resource.
 - **last_event** — show timestamp and truncated message as a sub-row or parenthetical when non-null.
 - **FailedMount** — always name the secret, never just the count.
-- **Recommendations** — all CRITICALs shown; WARNs capped at 10. Each recommendation includes a concrete kubectl command. Ordered CRITICAL → WARN.
+- **Recommendations** — all CRITICALs shown; WARNs capped at 10. Distinguish read-only
+  evidence commands from mutating proposals, and require operator review. Ordered
+  CRITICAL → WARN.
 - **No trailing summaries** — end at SUMMARY. No "in conclusion" paragraphs.
 - **No raw JSON or kubectl output** — interpret and present; never paste verbatim.
 
@@ -437,8 +445,10 @@ Present in this order:
    - Group by namespace; show memory limit next to each OOMKilled container if available
 6. OOM analysis — if OOMKilling events are present:
    - Parse `anon-rss` values from all OOMKill event messages
-   - Rank by anon-rss descending — the largest single consumer is the likely trigger
+   - Rank by anon-rss descending — the largest observed value is an evidence candidate,
+     not proof of the trigger
    - Note whether it has a memory limit set
-   - Emit: "Largest OOM consumer: <process> in <namespace>/<pod> — <N> GB anon-rss, memory limit: <limit | none>"
+   - Emit: "Largest observed OOM event: <process> in <namespace>/<pod> — <N> GB
+     anon-rss, memory limit: <limit | none>; verify against node logs and metrics"
 7. Recent node events, last 15, all types sorted newest first
    - Reconstruct the timeline: when did OOMKills start, when did the kubelet first restart, when did NodeNotReady occur

@@ -7,6 +7,23 @@ Versioning: [Semantic Versioning](https://semver.org/)
 
 ---
 
+## [Unreleased]
+
+### Added
+- JSON schema 1.2 evidence metadata: `tool_version`, collector coverage,
+  `collection_status`, `check_id`, and typed `subjects`.
+- EndpointSlice-aware ready and not-ready address counting with Endpoints fallback.
+
+### Changed
+- Documentation now distinguishes observations, recommendations, and verified fixes.
+- Installation documentation reflects the current source-only public distribution.
+
+### Known limitations
+- Collection-status propagation does not yet cover every secondary and optional collector
+  path. A complete or healthy result is limited to the sources reported in coverage.
+
+---
+
 ## [1.3.0] — 2026-07-06
 
 ### Added — stable check IDs
@@ -30,7 +47,8 @@ Versioning: [Semantic Versioning](https://semver.org/)
 - Docs are vendor-neutral: the reasoning layer is described as "any AI agent (via MCP or a reference skill)" rather than Claude-specific.
 
 ### Added
-- **Krew** distribution: `.krew.yaml` plugin manifest and a tag-triggered release workflow — `kubectl krew install sentinel`.
+- Draft **Krew** distribution metadata: `.krew.yaml` and a tag-triggered release workflow.
+  The plugin is not yet published in the official Krew index.
 - **Homebrew** formula template under `packaging/homebrew/`.
 - `Documentation voice` standard in `CONTRIBUTING.md`.
 
@@ -48,7 +66,9 @@ _No behavioural change to the checks._
 - **CERTS** — cert-manager `Certificate` expiry from `.status.notAfter` (expired/≤7d CRITICAL, ≤21d WARN) and not-`Ready` (CRITICAL); gracefully skipped when the CRD is absent
 
 ### Added — extensions to existing sections
-- **PODS** — flags containers with no CPU request (poor scheduling + lowest QoS/eviction priority) (WARN)
+- **PODS** — flags containers with no CPU request. Missing requests can reduce scheduling
+  accuracy and leave demand unreserved; QoS and eviction priority depend on the complete
+  resource configuration and Pod priority. (WARN)
 - **WORKLOADS** — flags Deployments whose rollout is not Progressing (e.g. `ProgressDeadlineExceeded`) while old replicas stay up (WARN)
 
 ### Notes
