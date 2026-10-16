@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.2",
+  "tool_version": "1.3.2",
+  "generated_at": "2026-10-17T00:00:00Z",
+  "context": "test",
+  "scope": "namespace: demo",
+  "exit_code": 1,
+  "summary": { "critical": 0, "warn": 1, "ok": 0 },
+  "coverage": {
+    "collectors": [
+      { "collector_id": "HTTP", "query_id": "kube.snapshot.HTTP", "collection_status": "failed" }
+    ]
+  },
+  "sections": [
+    {
+      "section": "HTTP",
+      "collection_status": "failed",
+      "findings": [
+        {
+          "id": "HTTP-COLLECT-FAILED",
+          "check_id": "HTTP-COLLECT-FAILED",
+          "severity": "WARN",
+          "message": "Could not retrieve services",
+          "recommendation": null,
+          "last_event": null,
+          "source": "kubectl-sentinel",
+          "tool_version": "1.3.2",
+          "collection_status": "failed",
+          "subjects": null
+        }
+      ]
+    }
+  ]
+}

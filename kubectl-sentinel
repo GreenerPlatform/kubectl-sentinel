@@ -5,7 +5,7 @@
 # Version: 1.3.0
 # Usage: kubectl sentinel [-n namespace] [pod/<name>] [node/<name>] [--json] [--no-color]
 # Requires: kubectl, jq
-TOOL_VERSION="1.3.1"
+TOOL_VERSION="1.3.2"
 
 set -euo pipefail
 
@@ -60,7 +60,45 @@ JSON_IDS=()          # stable check id per finding (e.g. POD-CRASHLOOP) — a du
 JSON_MSGS=()
 JSON_RECS=()
 JSON_LAST_EVENTS=()  # structured last-event per finding (empty string = none)
+JSON_COLL_STATUS=()  # complete | partial | failed | not_available (W5 evidence contract)
+JSON_SUBJECTS=()     # optional JSON array of {kind,namespace,name,uid} per finding
 JSON_FINDING_COUNT=0
+_CURRENT_SECTION_COLL_STATUS="complete"
+
+_reset_section_collection() {
+  _CURRENT_SECTION_COLL_STATUS="complete"
+}
+
+_mark_section_collection() {
+  local status="$1"
+  case "$status" in
+    failed) _CURRENT_SECTION_COLL_STATUS="failed" ;;
+    not_available) _CURRENT_SECTION_COLL_STATUS="not_available" ;;
+    partial)
+      [[ "$_CURRENT_SECTION_COLL_STATUS" == "complete" ]] && _CURRENT_SECTION_COLL_STATUS="partial"
+      ;;
+  esac
+}
+
+_attach_subjects_json() {
+  [[ "$JSON_MODE" != true || "$JSON_FINDING_COUNT" -lt 1 ]] && return
+  local last=$(( JSON_FINDING_COUNT - 1 ))
+  JSON_SUBJECTS[$last]="$1"
+}
+
+_subjects_from_pod_json() {
+  local pod_json="$1"
+  echo "$pod_json" | jq -c '
+    . as $pod |
+    [{kind:"Pod", namespace:$pod.metadata.namespace, name:$pod.metadata.name, uid:($pod.metadata.uid // "")}]
+    + (($pod.metadata.ownerReferences // []) | map({
+        kind: .kind,
+        namespace: $pod.metadata.namespace,
+        name: .name,
+        uid: (.uid // ""),
+        relation: "ownerReference"
+      }))'
+}
 
 # ── Output helpers ────────────────────────────────────────────────────────────
 section() {
@@ -77,6 +115,7 @@ section() {
   _SECTION_START_OK="$OK_COUNT"
 
   JSON_CURRENT_SECTION="$1"
+  _reset_section_collection
   if [[ "$JSON_MODE" == false ]]; then
     echo -e "\n${BOLD}${CYAN}━━ $1 ━━${RESET}"
     if [[ -z "$POD_TARGET" && -z "$NODE_TARGET" ]]; then
@@ -135,6 +174,8 @@ critical() {
   if [[ "$JSON_MODE" == true ]]; then
     JSON_SECS+=("$JSON_CURRENT_SECTION"); JSON_SEVS+=("CRITICAL"); JSON_IDS+=("$cid")
     JSON_MSGS+=("$msg"); JSON_RECS+=(""); JSON_LAST_EVENTS+=("")
+    JSON_COLL_STATUS+=("${_CURRENT_SECTION_COLL_STATUS}")
+    JSON_SUBJECTS+=("")
     JSON_FINDING_COUNT=$((JSON_FINDING_COUNT + 1))
   elif [[ -n "$POD_TARGET" || -n "$NODE_TARGET" ]]; then
     echo -e "  ${RED}[CRITICAL]${RESET} ${DIM}${cid}${RESET}  $msg"
@@ -149,6 +190,8 @@ warn() {
   if [[ "$JSON_MODE" == true ]]; then
     JSON_SECS+=("$JSON_CURRENT_SECTION"); JSON_SEVS+=("WARN"); JSON_IDS+=("$cid")
     JSON_MSGS+=("$msg"); JSON_RECS+=(""); JSON_LAST_EVENTS+=("")
+    JSON_COLL_STATUS+=("${_CURRENT_SECTION_COLL_STATUS}")
+    JSON_SUBJECTS+=("")
     JSON_FINDING_COUNT=$((JSON_FINDING_COUNT + 1))
   elif [[ -n "$POD_TARGET" || -n "$NODE_TARGET" ]]; then
     echo -e "  ${YELLOW}[WARN]${RESET} ${DIM}${cid}${RESET}  $msg"
@@ -163,6 +206,8 @@ ok() {
   if [[ "$JSON_MODE" == true ]]; then
     JSON_SECS+=("$JSON_CURRENT_SECTION"); JSON_SEVS+=("OK"); JSON_IDS+=("$cid")
     JSON_MSGS+=("$msg"); JSON_RECS+=(""); JSON_LAST_EVENTS+=("")
+    JSON_COLL_STATUS+=("${_CURRENT_SECTION_COLL_STATUS}")
+    JSON_SUBJECTS+=("")
     JSON_FINDING_COUNT=$((JSON_FINDING_COUNT + 1))
   elif [[ -n "$POD_TARGET" || -n "$NODE_TARGET" ]]; then
     echo -e "  ${GREEN}[ OK ]${RESET} $msg"
@@ -524,21 +569,44 @@ emit_json() {
       if [[ -z "$last_evt" ]]; then last_evt_val="null"
       else last_evt_val="$last_evt"; fi
 
+      local coll="${JSON_COLL_STATUS[$i]:-complete}"
+      local subj="${JSON_SUBJECTS[$i]:-}"
+      local subj_val
+      if [[ -z "$subj" ]]; then subj_val="null"; else subj_val="$subj"; fi
+
       findings_json+="$(printf '%s' "${JSON_MSGS[$i]}" | jq -Rs \
         --arg id "${JSON_IDS[$i]}" \
         --arg sev "${JSON_SEVS[$i]}" \
         --arg src "kubectl-sentinel" \
         --arg tver "$TOOL_VERSION" \
+        --arg coll "$coll" \
         --argjson rec "$rec_val" \
         --argjson last_event "$last_evt_val" \
+        --argjson subjects "$subj_val" \
         '{id:$id, check_id:$id, severity:$sev, message:., recommendation:$rec, last_event:$last_event,
-          source:$src, tool_version:$tver, collection_status:"complete"}')"
+          source:$src, tool_version:$tver, collection_status:$coll, subjects:$subjects}')"
     done
     findings_json+="]"
 
-    sections_json+="{\"section\":\"${sec}\",\"findings\":${findings_json}}"
+    local sec_coll="complete"
+    for (( i=0; i<JSON_FINDING_COUNT; i++ )); do
+      [[ "${JSON_SECS[$i]}" != "$sec" ]] && continue
+      case "${JSON_COLL_STATUS[$i]:-complete}" in
+        failed) sec_coll="failed"; break ;;
+        not_available) [[ "$sec_coll" != "failed" ]] && sec_coll="not_available" ;;
+        partial) [[ "$sec_coll" == "complete" ]] && sec_coll="partial" ;;
+      esac
+    done
+
+    sections_json+="{\"section\":\"${sec}\",\"collection_status\":\"${sec_coll}\",\"findings\":${findings_json}}"
   done
   sections_json+="]"
+
+  local coverage_json="[]"
+  if [[ "$JSON_FINDING_COUNT" -gt 0 ]]; then
+    coverage_json="$(jq -n --argjson sections "$sections_json" '
+      [$sections[] | {collector_id: .section, query_id: ("kube.snapshot." + .section), collection_status: .collection_status}]')"
+  fi
 
   jq -n \
     --arg ver "1.2" \
@@ -551,8 +619,10 @@ emit_json() {
     --argjson warn "$WARN_COUNT" \
     --argjson ok "$OK_COUNT" \
     --argjson sections "$sections_json" \
+    --argjson coverage "$coverage_json" \
     '{schema_version:$ver, tool_version:$tver, generated_at:$ts, context:$ctx, scope:$scope, exit_code:$exit_code,
       summary:{critical:$critical, warn:$warn, ok:$ok},
+      coverage:{collectors:$coverage},
       sections:$sections}'
 
   exit "$exit_code"
@@ -675,7 +745,7 @@ HTML_HEAD
 check_nodes() {
   section "NODES"
   local nodes_json any_issue=false
-  nodes_json="$(kube get nodes -o json 2>/dev/null)" || { warn "Could not retrieve nodes"; return; }
+  nodes_json="$(kube get nodes -o json 2>/dev/null)" || { _mark_section_collection failed; warn "Could not retrieve nodes" "NODES-COLLECT-FAILED"; return; }
 
   local count
   count="$(echo "$nodes_json" | jq '.items | length')"
@@ -934,7 +1004,7 @@ check_pods() {
   section "PODS"
   local pods_json any_issue=false
   # shellcheck disable=SC2086
-  pods_json="$(kube get pods $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve pods"; return; }
+  pods_json="$(kube get pods $NS_FLAG -o json 2>/dev/null)" || { _mark_section_collection failed; warn "Could not retrieve pods" "PODS-COLLECT-FAILED"; return; }
 
   local total
   total="$(echo "$pods_json" | jq '.items | length')"
@@ -959,6 +1029,7 @@ check_pods() {
       local reason
       reason="$(echo "$pod_json" | jq -r '.status.reason // "unknown"')"
       critical "Pod ${ns}/${name} Failed — reason: ${reason}" "POD-FAILED"
+      _attach_subjects_json "$(_subjects_from_pod_json "$pod_json")"
       critical_rec "Pod ${ns}/${name}: inspect with 'kubectl describe pod ${name} -n ${ns}' and 'kubectl logs ${name} -n ${ns}'"
       any_issue=true
     fi
@@ -977,6 +1048,7 @@ check_pods() {
           # Always individual — each crash loop has a distinct cause
           _ctr_crash_loop=true
           critical "Pod ${ns}/${name} container ${cname}: CrashLoopBackOff (restarts: ${restarts}, last exit: ${exit_code:-?})" "POD-CRASHLOOP"
+          _attach_subjects_json "$(_subjects_from_pod_json "$pod_json")"
           critical_rec "Pod ${ns}/${name}/${cname}: check previous logs — 'kubectl logs ${name} -n ${ns} -c ${cname} --previous'"
           any_issue=true ;;
         OOMKilled)
@@ -1241,7 +1313,7 @@ check_deployments() {
 
   local deploy_json deploy_count=0 deploy_issue=false
   # shellcheck disable=SC2086
-  deploy_json="$(kube get deployments $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve Deployments"; deploy_json='{"items":[]}'; }
+  deploy_json="$(kube get deployments $NS_FLAG -o json 2>/dev/null)" || { _mark_section_collection partial; warn "Could not retrieve Deployments" "WORKLOADS-DEPLOY-FAILED"; deploy_json='{"items":[]}'; }
   deploy_count="$(echo "$deploy_json" | jq '.items | length')"
 
   while IFS= read -r d_json; do
@@ -1369,7 +1441,7 @@ check_http() {
   section "HTTP"
   local svc_json ep_json eps_json ing_json any_issue=false
   # shellcheck disable=SC2086
-  svc_json="$(kube get services $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve services" "HTTP-COLLECT-FAILED"; return; }
+  svc_json="$(kube get services $NS_FLAG -o json 2>/dev/null)" || { _mark_section_collection failed; warn "Could not retrieve services" "HTTP-COLLECT-FAILED"; return; }
   # shellcheck disable=SC2086
   ep_json="$(kube get endpoints $NS_FLAG -o json 2>/dev/null)" || true
   # shellcheck disable=SC2086
@@ -1428,7 +1500,7 @@ check_grpc() {
   section "gRPC"
   local svc_json ep_json eps_json any_issue=false
   # shellcheck disable=SC2086
-  svc_json="$(kube get services $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve services" "GRPC-COLLECT-FAILED"; return; }
+  svc_json="$(kube get services $NS_FLAG -o json 2>/dev/null)" || { _mark_section_collection failed; warn "Could not retrieve services" "GRPC-COLLECT-FAILED"; return; }
   # shellcheck disable=SC2086
   ep_json="$(kube get endpoints $NS_FLAG -o json 2>/dev/null)" || true
   # shellcheck disable=SC2086
@@ -1473,7 +1545,7 @@ check_events() {
   events_json="$(kube get events $NS_FLAG \
     --field-selector type=Warning \
     --sort-by='.lastTimestamp' \
-    -o json 2>/dev/null)" || { warn "Could not retrieve events"; return; }
+    -o json 2>/dev/null)" || { _mark_section_collection failed; warn "Could not retrieve events" "EVENTS-COLLECT-FAILED"; return; }
 
   local total
   total="$(echo "$events_json" | jq '.items | length')"
@@ -1557,7 +1629,7 @@ check_resources() {
   local any_issue=false
 
   local node_top
-  node_top="$(kube top nodes 2>/dev/null)" || { info "kubectl top nodes unavailable (metrics-server not installed?)"; return; }
+  node_top="$(kube top nodes 2>/dev/null)" || { _mark_section_collection not_available; info "kubectl top nodes unavailable (metrics-server not installed?)"; return; }
 
   while read -r node cpu_abs cpu_pct mem_abs mem_pct; do
     local cpu_val mem_val
@@ -1596,7 +1668,7 @@ check_pvcs() {
   section "PVCS"
   local pvc_json any_issue=false
   # shellcheck disable=SC2086
-  pvc_json="$(kube get pvc $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve PVCs"; return; }
+  pvc_json="$(kube get pvc $NS_FLAG -o json 2>/dev/null)" || { _mark_section_collection failed; warn "Could not retrieve PVCs" "PVCS-COLLECT-FAILED"; return; }
 
   local count
   count="$(echo "$pvc_json" | jq '.items | length')"
