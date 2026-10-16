@@ -5,7 +5,7 @@
 # Version: 1.3.0
 # Usage: kubectl sentinel [-n namespace] [pod/<name>] [node/<name>] [--json] [--no-color]
 # Requires: kubectl, jq
-TOOL_VERSION="1.3.0"
+TOOL_VERSION="1.3.1"
 
 set -euo pipefail
 
@@ -527,9 +527,12 @@ emit_json() {
       findings_json+="$(printf '%s' "${JSON_MSGS[$i]}" | jq -Rs \
         --arg id "${JSON_IDS[$i]}" \
         --arg sev "${JSON_SEVS[$i]}" \
+        --arg src "kubectl-sentinel" \
+        --arg tver "$TOOL_VERSION" \
         --argjson rec "$rec_val" \
         --argjson last_event "$last_evt_val" \
-        '{id:$id, severity:$sev, message:., recommendation:$rec, last_event:$last_event}')"
+        '{id:$id, check_id:$id, severity:$sev, message:., recommendation:$rec, last_event:$last_event,
+          source:$src, tool_version:$tver, collection_status:"complete"}')"
     done
     findings_json+="]"
 
@@ -538,7 +541,8 @@ emit_json() {
   sections_json+="]"
 
   jq -n \
-    --arg ver "1.1" \
+    --arg ver "1.2" \
+    --arg tver "$TOOL_VERSION" \
     --arg ts "$(ts)" \
     --arg ctx "$ctx" \
     --arg scope "$scope_str" \
@@ -547,7 +551,7 @@ emit_json() {
     --argjson warn "$WARN_COUNT" \
     --argjson ok "$OK_COUNT" \
     --argjson sections "$sections_json" \
-    '{schema_version:$ver, generated_at:$ts, context:$ctx, scope:$scope, exit_code:$exit_code,
+    '{schema_version:$ver, tool_version:$tver, generated_at:$ts, context:$ctx, scope:$scope, exit_code:$exit_code,
       summary:{critical:$critical, warn:$warn, ok:$ok},
       sections:$sections}'
 
@@ -1322,14 +1326,54 @@ check_deployments() {
   if [[ "$ds_issue" == false ]]; then ok "DaemonSets: ${ds_count} checked — all healthy"; fi
 }
 
+# Ready / not-ready endpoint counts for a Service (Endpoints API, then EndpointSlice).
+# Prints: "<ready> <not_ready>"
+svc_endpoint_counts() {
+  local ns="$1" name="$2" ep_json="$3" eps_json="$4"
+  local subsets ready=0 not_ready=0
+  subsets="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
+    [.items[]?
+     | select(.metadata.namespace==$ns and .metadata.name==$name)
+     | (.subsets // []) | length] | add // 0' 2>/dev/null || echo 0)"
+
+  if [[ "${subsets:-0}" -gt 0 ]]; then
+    ready="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
+      .items[]?
+      | select(.metadata.namespace==$ns and .metadata.name==$name)
+      | [(.subsets[]?.addresses // [])[]] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+    not_ready="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
+      .items[]?
+      | select(.metadata.namespace==$ns and .metadata.name==$name)
+      | [(.subsets[]?.notReadyAddresses // [])[]] | length' 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+  else
+    ready="$(echo "$eps_json" | jq -r --arg ns "$ns" --arg name "$name" '
+      [.items[]?
+       | select(.metadata.namespace==$ns)
+       | select((.metadata.labels["kubernetes.io/service-name"] // "") == $name)
+       | .endpoints[]?
+       | select((.conditions.ready // true) == true)
+      ] | length' 2>/dev/null || echo 0)"
+    not_ready="$(echo "$eps_json" | jq -r --arg ns "$ns" --arg name "$name" '
+      [.items[]?
+       | select(.metadata.namespace==$ns)
+       | select((.metadata.labels["kubernetes.io/service-name"] // "") == $name)
+       | .endpoints[]?
+       | select(has("conditions") and (.conditions.ready // true) == false)
+      ] | length' 2>/dev/null || echo 0)"
+  fi
+  echo "${ready:-0} ${not_ready:-0}"
+}
+
 # ── HTTP ──────────────────────────────────────────────────────────────────────
 check_http() {
   section "HTTP"
-  local svc_json ep_json ing_json any_issue=false
+  local svc_json ep_json eps_json ing_json any_issue=false
   # shellcheck disable=SC2086
-  svc_json="$(kube get services $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve services"; return; }
+  svc_json="$(kube get services $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve services" "HTTP-COLLECT-FAILED"; return; }
   # shellcheck disable=SC2086
   ep_json="$(kube get endpoints $NS_FLAG -o json 2>/dev/null)" || true
+  # shellcheck disable=SC2086
+  eps_json="$(kube get endpointslice $NS_FLAG -o json 2>/dev/null)" || true
   # shellcheck disable=SC2086
   ing_json="$(kube get ingresses $NS_FLAG -o json 2>/dev/null)" || true
 
@@ -1348,27 +1392,17 @@ check_http() {
       .port' | head -1)"
     [[ -z "$has_http_port" ]] && continue
 
-    local ep_subsets
-    ep_subsets="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
-      .items[] |
-      select(.metadata.namespace==$ns and .metadata.name==$name) |
-      .subsets // [] | length')"
+    local ep_ready ep_not_ready
+    read -r ep_ready ep_not_ready <<< "$(svc_endpoint_counts "$ns" "$name" "$ep_json" "$eps_json")"
 
-    if [[ "${ep_subsets:-0}" -eq 0 ]]; then
+    if [[ "${ep_ready:-0}" -eq 0 && "${ep_not_ready:-0}" -eq 0 ]]; then
       critical "HTTP Service ${ns}/${name}:${has_http_port} — no endpoints (no backing pods)" "HTTP-NO-ENDPOINTS"
       critical_rec "HTTP Service ${ns}/${name}: verify selector labels match pods — 'kubectl describe svc ${name} -n ${ns}'"
       any_issue=true
-    else
-      local not_ready
-      not_ready="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
-        .items[] |
-        select(.metadata.namespace==$ns and .metadata.name==$name) |
-        (.notReadyAddresses // []) | length')"
-      if [[ "${not_ready:-0}" -gt 0 ]]; then
-        warn "HTTP Service ${ns}/${name}:${has_http_port} — ${not_ready} endpoint(s) not ready" "HTTP-ENDPOINTS-NOT-READY"
-        warn_rec "HTTP Service ${ns}/${name}: pods exist but not ready — check readiness probe and pod health"
-        any_issue=true
-      fi
+    elif [[ "${ep_not_ready:-0}" -gt 0 ]]; then
+      warn "HTTP Service ${ns}/${name}:${has_http_port} — ${ep_not_ready} endpoint(s) not ready" "HTTP-ENDPOINTS-NOT-READY"
+      warn_rec "HTTP Service ${ns}/${name}: pods exist but not ready — check readiness probe and pod health"
+      any_issue=true
     fi
   done < <(echo "$svc_json" | jq -c '.items[]')
 
@@ -1392,11 +1426,13 @@ check_http() {
 # ── gRPC ──────────────────────────────────────────────────────────────────────
 check_grpc() {
   section "gRPC"
-  local svc_json ep_json any_issue=false
+  local svc_json ep_json eps_json any_issue=false
   # shellcheck disable=SC2086
-  svc_json="$(kube get services $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve services"; return; }
+  svc_json="$(kube get services $NS_FLAG -o json 2>/dev/null)" || { warn "Could not retrieve services" "GRPC-COLLECT-FAILED"; return; }
   # shellcheck disable=SC2086
   ep_json="$(kube get endpoints $NS_FLAG -o json 2>/dev/null)" || true
+  # shellcheck disable=SC2086
+  eps_json="$(kube get endpointslice $NS_FLAG -o json 2>/dev/null)" || true
 
   while IFS= read -r svc_item; do
     local ns name matched_port
@@ -1412,27 +1448,17 @@ check_grpc() {
       ) | .port' | head -1)"
     [[ -z "$matched_port" ]] && continue
 
-    local ep_subsets
-    ep_subsets="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
-      .items[] |
-      select(.metadata.namespace==$ns and .metadata.name==$name) |
-      .subsets // [] | length')"
+    local ep_ready ep_not_ready
+    read -r ep_ready ep_not_ready <<< "$(svc_endpoint_counts "$ns" "$name" "$ep_json" "$eps_json")"
 
-    if [[ "${ep_subsets:-0}" -eq 0 ]]; then
+    if [[ "${ep_ready:-0}" -eq 0 && "${ep_not_ready:-0}" -eq 0 ]]; then
       critical "gRPC Service ${ns}/${name}:${matched_port} — no endpoints (no backing pods)" "GRPC-NO-ENDPOINTS"
       critical_rec "gRPC Service ${ns}/${name}: verify selector labels match pods — 'kubectl describe svc ${name} -n ${ns}'"
       any_issue=true
-    else
-      local not_ready
-      not_ready="$(echo "$ep_json" | jq -r --arg ns "$ns" --arg name "$name" '
-        .items[] |
-        select(.metadata.namespace==$ns and .metadata.name==$name) |
-        (.notReadyAddresses // []) | length')"
-      if [[ "${not_ready:-0}" -gt 0 ]]; then
-        warn "gRPC Service ${ns}/${name}:${matched_port} — ${not_ready} endpoint(s) not ready" "GRPC-ENDPOINTS-NOT-READY"
-        warn_rec "gRPC Service ${ns}/${name}: pods not ready — check readiness probe configuration and pod events"
-        any_issue=true
-      fi
+    elif [[ "${ep_not_ready:-0}" -gt 0 ]]; then
+      warn "gRPC Service ${ns}/${name}:${matched_port} — ${ep_not_ready} endpoint(s) not ready" "GRPC-ENDPOINTS-NOT-READY"
+      warn_rec "gRPC Service ${ns}/${name}: pods not ready — check readiness probe configuration and pod events"
+      any_issue=true
     fi
   done < <(echo "$svc_json" | jq -c '.items[]')
 

@@ -27,3 +27,6 @@ jobs:
           chmod +x kubectl-sentinel
           ./kubectl-sentinel --version
           ./kubectl-sentinel --help >/dev/null
+
+      - name: Proof program W5 gate (evidence integrity fixtures)
+        run: bash scripts/w5_proof_gate.sh

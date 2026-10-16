@@ -1,0 +1,18 @@
+{
+  "endpoints": {"items": []},
+  "endpointslice": {
+    "items": [
+      {
+        "metadata": {
+          "namespace": "payments",
+          "name": "api-svc-abc",
+          "labels": {"kubernetes.io/service-name": "api-svc"}
+        },
+        "endpoints": [
+          {"addresses": ["10.0.0.5"], "conditions": {"ready": true}}
+        ]
+      }
+    ]
+  },
+  "service": {"metadata": {"namespace": "payments", "name": "api-svc"}}
+}
