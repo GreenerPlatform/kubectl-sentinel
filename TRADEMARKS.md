@@ -7,7 +7,7 @@ The project claims trademark rights in:
 
 - **GreenerPlatform** (the project and organization name)
 - **kubectl-sentinel** (this tool's name)
-- The **GreenerPlatform logo** and the "Engineer's Sketchbook" visual identity
+- The **GreenerPlatform Evidence Beacon** logo and associated visual identity
 
 Apache-2.0 grants no trademark license beyond reasonable and customary descriptive use.
 In practice:
