@@ -200,6 +200,17 @@ the alert, scores each sentinel finding by relevance, and emits compatibility fi
 as `root_cause`, `causation_chain`, and a P1 command. Their values are candidate hypotheses
 and response steps, not proof of causation or command safety.
 
+### Offline evidence
+
+Fixture-only checks (no cluster):
+
+```bash
+bash evidence/offline-pack/verify.sh
+```
+
+Same-input triage against a committed snapshot lives in the
+[incident-triage offline evidence pack](https://github.com/GreenerPlatform/incident-triage/tree/main/evidence/offline-pack).
+
 ## Using it from an AI agent (any runtime)
 
 Two paths, both vendor-neutral:
